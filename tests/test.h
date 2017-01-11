@@ -109,6 +109,7 @@ extern int test_broker_version;
 
 #define TEST_FAIL0(fail_now,...) do {					\
                 int is_thrd = 0;                                        \
+		TEST_SAYL(0, "TEST FAILURE\n");				\
 		fprintf(stderr, "\033[31m### Test \"%s\" failed at %s:%i:%s(): ###\n", \
 			test_curr->name,                                \
                         __FILE__,__LINE__,__FUNCTION__);                \
@@ -198,6 +199,7 @@ void test_wait_exit (int timeout);
 
 uint64_t test_id_generate (void);
 char *test_str_id_generate (char *dest, size_t dest_size);
+const char *test_str_id_generate_tmp (void);
 
 
 /**
@@ -269,16 +271,16 @@ static RD_UNUSED int TIMING_EVERY (test_timing_t *timing, int us) {
 void test_msg_fmt (char *dest, size_t dest_size,
 		   uint64_t testid, int32_t partition, int msgid);
 void test_msg_parse0 (const char *func, int line,
-		      uint64_t testid, const void *ptr, size_t size,
+		      uint64_t testid, rd_kafka_message_t *rkmessage,
 		      int32_t exp_partition, int *msgidp);
-#define test_msg_parse(testid,ptr,size,exp_partition,msgidp)	\
+#define test_msg_parse(testid,rkmessage,exp_partition,msgidp)	\
 	test_msg_parse0(__FUNCTION__,__LINE__,\
-			testid,ptr,size,exp_partition,msgidp)
+			testid,rkmessage,exp_partition,msgidp)
 
 
 static RD_INLINE int jitter (int low, int high) RD_UNUSED;
 static RD_INLINE int jitter (int low, int high) {
-	return (low + (rand() % (high+1)));
+	return (low + (rand() % ((high-low)+1)));
 }
 
 
@@ -484,6 +486,8 @@ void test_consumer_unassign (const char *what, rd_kafka_t *rk);
 
 void test_consumer_close (rd_kafka_t *rk);
 
+void test_flush (rd_kafka_t *rk, int timeout_ms);
+
 void test_conf_set (rd_kafka_conf_t *conf, const char *name, const char *val);
 char *test_conf_get (rd_kafka_conf_t *conf, const char *name);
 void test_topic_conf_set (rd_kafka_topic_conf_t *tconf,
@@ -492,11 +496,18 @@ void test_topic_conf_set (rd_kafka_topic_conf_t *tconf,
 void test_print_partition_list (const rd_kafka_topic_partition_list_t
 				*partitions);
 
+void test_kafka_topics (const char *fmt, ...);
 void test_create_topic (const char *topicname, int partition_cnt,
 			int replication_factor);
+void test_auto_create_topic_rkt (rd_kafka_t *rk, rd_kafka_topic_t *rkt);
 int test_check_builtin (const char *feature);
 void test_timeout_set (int timeout);
 
 char *tsprintf (const char *fmt, ...) RD_FORMAT(printf, 1, 2);
 
 void test_report_add (struct test *test, const char *fmt, ...);
+int test_can_create_topics (int skip);
+
+rd_kafka_event_t *test_wait_event (rd_kafka_queue_t *eventq,
+				   rd_kafka_event_type_t event_type,
+				   int timeout_ms);

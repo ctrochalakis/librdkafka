@@ -677,6 +677,8 @@ class ConsumerImpl : virtual public Consumer, virtual public HandleImpl {
   ErrorCode start (Topic *topic, int32_t partition, int64_t offset,
                    Queue *queue);
   ErrorCode stop (Topic *topic, int32_t partition);
+  ErrorCode seek (Topic *topic, int32_t partition, int64_t offset,
+		  int timeout_ms);
   Message *consume (Topic *topic, int32_t partition, int timeout_ms);
   Message *consume (Queue *queue, int timeout_ms);
   int consume_callback (Topic *topic, int32_t partition, int timeout_ms,
@@ -708,6 +710,11 @@ class ProducerImpl : virtual public Producer, virtual public HandleImpl {
                      const std::vector<char> *payload,
                      const std::vector<char> *key,
                      void *msg_opaque);
+
+  ErrorCode flush (int timeout_ms) {
+	  return static_cast<RdKafka::ErrorCode>(rd_kafka_flush(rk_,
+								timeout_ms));
+  }
 
   static Producer *create (Conf *conf, std::string &errstr);
 

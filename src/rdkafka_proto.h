@@ -120,8 +120,14 @@ const char *rd_kafka_ApiKey2str (int16_t ApiKey) {
 
 
 
+/* Offset + MessageSize */
 #define RD_KAFKAP_MESSAGESET_HDR_SIZE (8+4)
-#define RD_KAFKAP_MESSAGE_HDR_SIZE    (4+1+1)
+/* CRC + Magic + Attr + KeyLen + ValueLen + [Timestamp]
+ * @remark This includes the optional (MsgVer=1) Timestamp field (8 bytes) */
+#define RD_KAFKAP_MESSAGE_HDR_SIZE    (4+1+1+4+4+8)
+/* Maximum per-message overhead. */
+#define RD_KAFKAP_MESSAGE_OVERHEAD  \
+	(RD_KAFKAP_MESSAGESET_HDR_SIZE + RD_KAFKAP_MESSAGE_HDR_SIZE)
 
 
 /**
@@ -384,40 +390,8 @@ int rd_kafkap_bytes_cmp_data (const rd_kafkap_bytes_t *a,
 
 
 
-
-
-
-
-
-
-
-struct rd_kafkap_FetchRequest {
-	int32_t ReplicaId;
-	int32_t MaxWaitTime;
-	int32_t MinBytes;
-	int32_t TopicArrayCnt;
-};
-
-
-
-/* Non-protocol representation of a topic's metadata. */
-struct rd_kafka_TopicMetadata {
-	int16_t          ErrorCode;
-	rd_kafkap_str_t *Name;
-	struct {
-		int16_t  ErrorCode;
-		int32_t  PartitionId;
-		int32_t  Leader;
-		struct rd_kafka_broker_s *rkb;
-		int32_t *Replicas;
-		int32_t  Replicas_cnt;
-		int32_t *Isr;
-		int32_t  Isr_cnt;
-	} *PartitionMetadata;
-	int32_t PartitionMetadata_cnt;
-};
-
-
-
 typedef struct rd_kafka_buf_s rd_kafka_buf_t;
+
+
+#define RD_KAFKA_NODENAME_SIZE  128
 

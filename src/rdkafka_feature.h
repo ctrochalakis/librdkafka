@@ -55,8 +55,8 @@
 /* >= 0.8.2.0: Broker-based Group coordinator */
 #define RD_KAFKA_FEATURE_BROKER_GROUP_COORD 0x40
 
-
-
+/* >= 0.8.2.0: LZ4 compression (with bad and proper HC checksums) */
+#define RD_KAFKA_FEATURE_LZ4 0x80
 
 
 
@@ -65,6 +65,7 @@
 int rd_kafka_get_legacy_ApiVersions (const char *broker_version,
 				     struct rd_kafka_ApiVersion **apisp,
 				     size_t *api_cntp, const char *fallback);
+int rd_kafka_ApiVersion_is_queryable (const char *broker_version);
 void rd_kafka_ApiVersions_copy (const struct rd_kafka_ApiVersion *src, size_t src_cnt,
 				struct rd_kafka_ApiVersion **dstp, size_t *dst_cntp);
 int rd_kafka_features_check (rd_kafka_broker_t *rkb,

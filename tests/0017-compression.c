@@ -43,7 +43,7 @@ int main_0017_compression(int argc, char **argv) {
 	const int msg_cnt = 1000;
 	int msg_base = 0;
 	uint64_t testid;
-#define CODEC_CNT 3
+#define CODEC_CNT 4
 	const char *codecs[CODEC_CNT+1] = {
 		"none",
 #if WITH_ZLIB
@@ -51,6 +51,9 @@ int main_0017_compression(int argc, char **argv) {
 #endif
 #if WITH_SNAPPY
 		"snappy",
+#endif
+#if WITH_LZ4
+		"lz4",
 #endif
 		NULL
 	};
@@ -72,9 +75,16 @@ int main_0017_compression(int argc, char **argv) {
 		rkt_p = test_create_producer_topic(rk_p, topics[i],
 			"compression.codec", codecs[i], NULL);
 
+		/* Produce small message that will not decrease with
+		 * compression (issue #781) */
 		test_produce_msgs(rk_p, rkt_p, testid, partition,
-				  msg_base + (partition*msg_cnt), msg_cnt,
-				  NULL, 0);
+				  msg_base + (partition*msg_cnt), 1,
+				  NULL, 5);
+
+		/* Produce standard sized messages */
+		test_produce_msgs(rk_p, rkt_p, testid, partition,
+				  msg_base + (partition*msg_cnt) + 1, msg_cnt-1,
+				  NULL, 512);
 		rd_kafka_topic_destroy(rkt_p);
 	}
 

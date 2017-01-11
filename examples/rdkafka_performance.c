@@ -60,6 +60,9 @@ static int report_offset = 0;
 static FILE *latency_fp = NULL;
 static int msgcnt = -1;
 static int incremental_mode = 0;
+static int partition_cnt = 0;
+static int eof_cnt = 0;
+static int with_dr = 1;
 
 static void stop (int sig) {
         if (!run)
@@ -68,6 +71,7 @@ static void stop (int sig) {
 }
 
 static long int msgs_wait_cnt = 0;
+static long int msgs_wait_produce_cnt = 0;
 static rd_ts_t t_end;
 static rd_kafka_t *global_rk;
 
@@ -152,10 +156,13 @@ static void msg_delivered (rd_kafka_t *rk,
 	    (int)(now - last) >= dispintvl * 1000 ||
             verbosity >= 3) {
 		if (rkmessage->err && verbosity >= 2)
-			printf("%% Message delivery failed: %s (%li remain)\n",
+			printf("%% Message delivery failed: %s [%"PRId32"]: "
+			       "%s (%li remain)\n",
+			       rd_kafka_topic_name(rkmessage->rkt),
+			       rkmessage->partition,
 			       rd_kafka_err2str(rkmessage->err),
 			       msgs_wait_cnt);
-		else if (verbosity >= 2)
+		else if (verbosity > 2)
 			printf("%% Message delivered (offset %"PRId64"): "
                                "%li remain\n",
                                rkmessage->offset, msgs_wait_cnt);
@@ -169,7 +176,7 @@ static void msg_delivered (rd_kafka_t *rk,
         if (report_offset)
                 cnt.last_offset = rkmessage->offset;
 
-	if (msgs_wait_cnt == 0 && !forever) {
+	if (msgs_wait_produce_cnt == 0 && msgs_wait_cnt == 0 && !forever) {
 		if (verbosity >= 2)
 			printf("All messages delivered!\n");
 		t_end = rd_clock();
@@ -197,7 +204,7 @@ static void msg_consume (rd_kafka_message_t *rkmessage, void *opaque) {
                                        rd_kafka_topic_name(rkmessage->rkt),
                                        rkmessage->partition, rkmessage->offset);
 
-			if (exit_eof)
+			if (exit_eof && ++eof_cnt == partition_cnt)
 				run = 0;
 
 			return;
@@ -205,7 +212,7 @@ static void msg_consume (rd_kafka_message_t *rkmessage, void *opaque) {
 
 		printf("%% Consume error for topic \"%s\" [%"PRId32"] "
 		       "offset %"PRId64": %s\n",
-		       rd_kafka_topic_name(rkmessage->rkt),
+		       rkmessage->rkt ? rd_kafka_topic_name(rkmessage->rkt):"",
 		       rkmessage->partition,
 		       rkmessage->offset,
 		       rd_kafka_message_errstr(rkmessage));
@@ -217,6 +224,10 @@ static void msg_consume (rd_kafka_message_t *rkmessage, void *opaque) {
                 cnt.msgs_dr_err++;
 		return;
 	}
+
+	/* Start measuring from first message received */
+	if (!cnt.t_start)
+		cnt.t_start = cnt.t_last = rd_clock();
 
         cnt.offset = rkmessage->offset;
 	cnt.msgs++;
@@ -262,6 +273,37 @@ static void msg_consume (rd_kafka_message_t *rkmessage, void *opaque) {
 
         if (msgcnt != -1 && (int)cnt.msgs >= msgcnt)
                 run = 0;
+}
+
+
+static void rebalance_cb (rd_kafka_t *rk,
+			  rd_kafka_resp_err_t err,
+			  rd_kafka_topic_partition_list_t *partitions,
+			  void *opaque) {
+
+	switch (err)
+	{
+	case RD_KAFKA_RESP_ERR__ASSIGN_PARTITIONS:
+		fprintf(stderr,
+			"%% Group rebalanced: %d partition(s) assigned\n",
+			partitions->cnt);
+		eof_cnt = 0;
+		partition_cnt = partitions->cnt;
+		rd_kafka_assign(rk, partitions);
+		break;
+
+	case RD_KAFKA_RESP_ERR__REVOKE_PARTITIONS:
+		fprintf(stderr,
+			"%% Group rebalanced: %d partition(s) revoked\n",
+			partitions->cnt);
+		eof_cnt = 0;
+		partition_cnt = 0;
+		rd_kafka_assign(rk, NULL);
+		break;
+
+	default:
+		break;
+	}
 }
 
 
@@ -379,8 +421,10 @@ static void print_stats (rd_kafka_t *rk,
 		t_total = cnt.t_end_send - cnt.t_start;
 	else if (cnt.t_end)
 		t_total = cnt.t_end - cnt.t_start;
-	else
+	else if (cnt.t_start)
 		t_total = now - cnt.t_start;
+	else
+		t_total = 1;
 
         if (mode == 'P') {
 
@@ -525,7 +569,7 @@ static void print_stats (rd_kafka_t *rk,
                 if (incremental_mode && now > cnt.t_last) {
                         uint64_t i_msgs = cnt.msgs - cnt.msgs_last;
                         uint64_t i_bytes = cnt.bytes - cnt.bytes_last;
-                        uint64_t i_time = now - cnt.t_last;
+                        uint64_t i_time = cnt.t_last ? now - cnt.t_last : 0;
 
                         printf("%% INTERVAL: %"PRIu64" messages "
                                "(%"PRIu64" bytes) "
@@ -552,11 +596,10 @@ static void sig_usr1 (int sig) {
 }
 
 int main (int argc, char **argv) {
-	char *brokers = "localhost";
+	char *brokers = NULL;
 	char mode = 'C';
 	char *topic = NULL;
 	const char *key = NULL;
-	size_t partitions_num = 0;
         int *partitions = NULL;
 	int opt;
 	int sendflags = 0;
@@ -583,17 +626,16 @@ int main (int argc, char **argv) {
         int otype = _OTYPE_SUMMARY;
         double dtmp;
         int rate_sleep = 0;
+	rd_kafka_topic_partition_list_t *topics;
 
 	/* Kafka configuration */
 	conf = rd_kafka_conf_new();
 	rd_kafka_conf_set_error_cb(conf, err_cb);
 	rd_kafka_conf_set_throttle_cb(conf, throttle_cb);
-	rd_kafka_conf_set_dr_msg_cb(conf, msg_delivered);
 
 	/* Quick termination */
 	snprintf(tmp, sizeof(tmp), "%i", SIGIO);
 	rd_kafka_conf_set(conf, "internal.termination.signal", tmp, NULL, 0);
-
 
 	/* Producer config */
 	rd_kafka_conf_set(conf, "queue.buffering.max.messages", "500000",
@@ -610,26 +652,39 @@ int main (int argc, char **argv) {
 	 * Try other values with: ... -X queued.min.messages=1000
 	 */
 	rd_kafka_conf_set(conf, "queued.min.messages", "1000000", NULL, 0);
-
+	rd_kafka_conf_set(conf, "session.timeout.ms", "6000", NULL, 0);
 
 	/* Kafka topic configuration */
 	topic_conf = rd_kafka_topic_conf_new();
+	rd_kafka_topic_conf_set(topic_conf, "auto.offset.reset", "earliest",
+				NULL, 0);
+
+	topics = rd_kafka_topic_partition_list_new(1);
 
 	while ((opt =
 		getopt(argc, argv,
-		       "PCt:p:b:s:k:c:fi:MDd:m:S:x:"
-                       "R:a:z:o:X:B:eT:G:qvIur:lA:O")) != -1) {
+		       "PCG:t:p:b:s:k:c:fi:MDd:m:S:x:"
+                       "R:a:z:o:X:B:eT:Y:qvIur:lA:OwN")) != -1) {
 		switch (opt) {
+		case 'G':
+			if (rd_kafka_conf_set(conf, "group.id", optarg,
+					      errstr, sizeof(errstr)) !=
+			    RD_KAFKA_CONF_OK) {
+				fprintf(stderr, "%% %s\n", errstr);
+				exit(1);
+			}
+			/* FALLTHRU */
 		case 'P':
 		case 'C':
 			mode = opt;
 			break;
 		case 't':
-			topic = optarg;
+			rd_kafka_topic_partition_list_add(topics, optarg,
+							  RD_KAFKA_PARTITION_UA);
 			break;
 		case 'p':
-			partitions = realloc(partitions, ++partitions_num);
-			partitions[partitions_num-1] = atoi(optarg);
+			partitions = realloc(partitions, ++partition_cnt);
+			partitions[partition_cnt-1] = atoi(optarg);
 			break;
 
 		case 'b':
@@ -754,7 +809,7 @@ int main (int argc, char **argv) {
 		case 'T':
                         stats_intvlstr = optarg;
 			break;
-                case 'G':
+                case 'Y':
                         stats_cmd = optarg;
                         break;
 
@@ -816,13 +871,17 @@ int main (int argc, char **argv) {
 			incremental_mode = 1;
 			break;
 
+		case 'N':
+			with_dr = 0;
+			break;
+
 		default:
                         fprintf(stderr, "Unknown option: %c\n", opt);
 			goto usage;
 		}
 	}
 
-	if (!topic || optind != argc) {
+	if (topics->cnt == 0 || optind != argc) {
                 if (optind < argc)
                         fprintf(stderr, "Unknown argument: %s\n", argv[optind]);
 	usage:
@@ -833,8 +892,9 @@ int main (int argc, char **argv) {
 			"librdkafka version %s (0x%08x)\n"
 			"\n"
 			" Options:\n"
-			"  -C | -P      Consumer or Producer mode\n"
-			"  -t <topic>   Topic to fetch / produce\n"
+			"  -C | -P |    Consumer or Producer mode\n"
+			"  -G <groupid> High-level Kafka Consumer mode\n"
+			"  -t <topic>   Topic to consume / produce\n"
 			"  -p <num>     Partition (defaults to random). "
 			"Multiple partitions are allowed in -C consumer mode.\n"
 			"  -M           Print consumer interval stats\n"
@@ -865,7 +925,7 @@ int main (int argc, char **argv) {
 			"               of supported properties.\n"
 			"  -T <intvl>   Enable statistics from librdkafka at "
 			"specified interval (ms)\n"
-                        "  -G <command> Pipe statistics to <command>\n"
+                        "  -Y <command> Pipe statistics to <command>\n"
 			"  -I           Idle: dont produce any messages\n"
 			"  -q           Decrease verbosity\n"
                         "  -v           Increase verbosity (default 1)\n"
@@ -878,6 +938,7 @@ int main (int argc, char **argv) {
 			"  -A <file>    Write per-message latency stats to "
 			"<file>. Requires -l\n"
                         "  -O           Report produced offset (producer)\n"
+			"  -N           No delivery reports (producer)\n"
 			"\n"
 			" In Consumer mode:\n"
 			"  consumes messages and prints thruput\n"
@@ -950,6 +1011,8 @@ int main (int argc, char **argv) {
 	if (msgcnt != -1)
 		forever = 0;
 
+	topic = topics->elems[0].topic;
+
 	if (mode == 'P') {
 		/*
 		 * Producer
@@ -992,6 +1055,9 @@ int main (int argc, char **argv) {
 			printf("%% Sending %i messages of size %i bytes\n",
 			       msgcnt, msgsize);
 
+		if (with_dr)
+			rd_kafka_conf_set_dr_msg_cb(conf, msg_delivered);
+
 		/* Create Kafka handle */
 		if (!(rk = rd_kafka_new(RD_KAFKA_PRODUCER, conf,
  					errstr, sizeof(errstr)))) {
@@ -1007,7 +1073,7 @@ int main (int argc, char **argv) {
 			rd_kafka_set_log_level(rk, 7);
 
 		/* Add broker(s) */
-		if (rd_kafka_brokers_add(rk, brokers) < 1) {
+		if (brokers && rd_kafka_brokers_add(rk, brokers) < 1) {
 			fprintf(stderr, "%% No valid brokers specified\n");
 			exit(1);
 		}
@@ -1026,6 +1092,8 @@ int main (int argc, char **argv) {
                         dr_disp_div = 10;
 
 		cnt.t_start = cnt.t_last = rd_clock();
+
+		msgs_wait_produce_cnt = msgcnt;
 
 		while (run && (msgcnt == -1 || (int)cnt.msgs < msgcnt)) {
 			/* Send/Produce message. */
@@ -1094,6 +1162,8 @@ int main (int argc, char **argv) {
 			}
 
 			msgs_wait_cnt++;
+			if (msgs_wait_produce_cnt != -1)
+				msgs_wait_produce_cnt--;
 			cnt.msgs++;
 			cnt.bytes += msgsize;
 
@@ -1143,6 +1213,8 @@ int main (int argc, char **argv) {
 		rd_kafka_destroy(rk);
                 global_rk = rk = NULL;
 
+		free(sbuf);
+
 	} else if (mode == 'C') {
 		/*
 		 * Consumer
@@ -1166,7 +1238,7 @@ int main (int argc, char **argv) {
 			rd_kafka_set_log_level(rk, 7);
 
 		/* Add broker(s) */
-		if (rd_kafka_brokers_add(rk, brokers) < 1) {
+		if (brokers && rd_kafka_brokers_add(rk, brokers) < 1) {
 			fprintf(stderr, "%% No valid brokers specified\n");
 			exit(1);
 		}
@@ -1180,7 +1252,7 @@ int main (int argc, char **argv) {
 
 		/* Start consuming */
 		rkqu = rd_kafka_queue_new(rk);
-		for (i=0 ; i<partitions_num ; ++i) {
+		for (i=0 ; i<(size_t)partition_cnt ; ++i) {
 			const int r = rd_kafka_consume_start_queue(rkt,
 				partitions[i], start_offset, rkqu);
 
@@ -1192,7 +1264,6 @@ int main (int argc, char **argv) {
 			}
 		}
 
-		cnt.t_start = cnt.t_last = rd_clock();
 		while (run && (msgcnt == -1 || msgcnt > (int)cnt.msgs)) {
 			/* Consume messages.
 			 * A message may either be a real message, or
@@ -1242,7 +1313,7 @@ int main (int argc, char **argv) {
 		cnt.t_end = rd_clock();
 
 		/* Stop consuming */
-		for (i=0 ; i<partitions_num ; ++i) {
+		for (i=0 ; i<(size_t)partition_cnt ; ++i) {
 			int r = rd_kafka_consume_stop(rkt, i);
 			if (r == -1) {
 				fprintf(stderr,
@@ -1263,6 +1334,75 @@ int main (int argc, char **argv) {
 		rd_kafka_destroy(rk);
 
                 global_rk = rk = NULL;
+
+	} else if (mode == 'G') {
+		/*
+		 * High-level balanced Consumer
+		 */
+		rd_kafka_resp_err_t err;
+
+		rd_kafka_conf_set_rebalance_cb(conf, rebalance_cb);
+		rd_kafka_conf_set_default_topic_conf(conf, topic_conf);
+
+		/* Create Kafka handle */
+		if (!(rk = rd_kafka_new(RD_KAFKA_CONSUMER, conf,
+					errstr, sizeof(errstr)))) {
+			fprintf(stderr,
+				"%% Failed to create Kafka consumer: %s\n",
+				errstr);
+			exit(1);
+		}
+
+		/* Forward all events to consumer queue */
+		rd_kafka_poll_set_consumer(rk);
+
+                global_rk = rk;
+
+		if (debug)
+			rd_kafka_set_log_level(rk, 7);
+
+		/* Add broker(s) */
+		if (brokers && rd_kafka_brokers_add(rk, brokers) < 1) {
+			fprintf(stderr, "%% No valid brokers specified\n");
+			exit(1);
+		}
+
+		err = rd_kafka_subscribe(rk, topics);
+		if (err) {
+			fprintf(stderr, "%% Subscribe failed: %s\n",
+				rd_kafka_err2str(err));
+			exit(1);
+		}
+		fprintf(stderr, "%% Waiting for group rebalance..\n");
+
+		while (run && (msgcnt == -1 || msgcnt > (int)cnt.msgs)) {
+			/* Consume messages.
+			 * A message may either be a real message, or
+			 * an event (if rkmessage->err is set).
+			 */
+			rd_kafka_message_t *rkmessage;
+			uint64_t fetch_latency;
+
+			fetch_latency = rd_clock();
+
+			rkmessage = rd_kafka_consumer_poll(rk, 1000);
+			if (rkmessage) {
+				msg_consume(rkmessage, NULL);
+				rd_kafka_message_destroy(rkmessage);
+			}
+
+			cnt.t_fetch_latency += rd_clock() - fetch_latency;
+
+			print_stats(rk, mode, otype, compression);
+		}
+		cnt.t_end = rd_clock();
+
+		err = rd_kafka_consumer_close(rk);
+		if (err)
+			fprintf(stderr, "%% Failed to close consumer: %s\n",
+				rd_kafka_err2str(err));
+
+		rd_kafka_destroy(rk);
 	}
 
 	print_stats(NULL, mode, otype|_OTYPE_FORCE, compression);
@@ -1278,6 +1418,8 @@ int main (int argc, char **argv) {
                 pclose(stats_fp);
                 stats_fp = NULL;
         }
+
+	rd_kafka_topic_partition_list_destroy(topics);
 
 	/* Let background threads clean up and terminate cleanly. */
 	rd_kafka_wait_destroyed(2000);

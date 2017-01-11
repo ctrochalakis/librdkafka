@@ -13,7 +13,7 @@ mkl_mkvar_set "" GEN_PKG_CONFIG y
 mkl_require cxx
 mkl_require lib
 mkl_require pic
-mkl_require atomics must pass
+mkl_require atomics
 mkl_require good_cflags
 mkl_require socket
 
@@ -42,6 +42,10 @@ function checks {
     # optional libs
     mkl_lib_check "zlib" "WITH_ZLIB" disable CC "-lz"
     mkl_lib_check "libcrypto" "" disable CC "-lcrypto"
+    mkl_lib_check "liblz4" "WITH_LZ4" disable CC "-llz4" \
+		  "
+#include <lz4frame.h>
+"
 
     # Snappy support is built-in
     mkl_allvar_set WITH_SNAPPY WITH_SNAPPY y

@@ -87,7 +87,7 @@ namespace RdKafka {
  * @remark This value should only be used during compile time,
  *         for runtime checks of version use RdKafka::version()
  */
-#define RD_KAFKA_VERSION  0x000901ff
+#define RD_KAFKA_VERSION  0x000902ff
 
 /**
  * @brief Returns the librdkafka version as integer.
@@ -216,6 +216,9 @@ enum ErrorCode {
 	ERR__NO_OFFSET = -168,
 	/** Outdated */
 	ERR__OUTDATED = -167,
+	/** Timed out in queue */
+	ERR__TIMED_OUT_QUEUE = -166,
+
 	/** End internal error codes */
 	ERR__END = -100,
 
@@ -487,6 +490,10 @@ class RD_EXPORT Event {
 
   /**
    * @returns Log message string.
+   *
+   * \c EVENT_LOG: Log message string.
+   * \c EVENT_STATS: JSON object (as string).
+   *
    * @remark Applies to LOG event type.
    */
   virtual std::string str () const = 0;
@@ -602,6 +609,7 @@ public:
    *
    * The results of automatic or manual offset commits will be scheduled
    * for this callback and is served by RdKafka::KafkaConsumer::consume()
+   * or RdKafka::KafkaConsumer::commitSync()
    *
    * If no partitions had valid offsets to commit this callback will be called
    * with \p err == ERR__NO_OFFSET which is not to be considered an error.
@@ -1451,6 +1459,23 @@ class RD_EXPORT Consumer : public virtual Handle {
   virtual ErrorCode stop (Topic *topic, int32_t partition) = 0;
 
   /**
+   * @brief Seek consumer for topic+partition to \p offset which is either an
+   *        absolute or logical offset.
+   *
+   * If \p timeout_ms is not 0 the call will wait this long for the
+   * seek to be performed. If the timeout is reached the internal state
+   * will be unknown and this function returns `ERR__TIMED_OUT`.
+   * If \p timeout_ms is 0 it will initiate the seek but return
+   * immediately without any error reporting (e.g., async).
+   *
+   * This call triggers a fetch queue barrier flush.
+   *
+   * @returns an ErrorCode to indicate success or failure.
+   */
+  virtual ErrorCode seek (Topic *topic, int32_t partition, int64_t offset,
+			  int timeout_ms) = 0;
+
+  /**
    * @brief Consume a single message from \p topic and \p partition.
    *
    * \p timeout_ms is maximum amount of time to wait for a message to be
@@ -1580,6 +1605,21 @@ class RD_EXPORT Producer : public virtual Handle {
                                        * and the \p payload pointer will not
                                        * be used by rdkafka after the
                                        * call returns. */
+  static const int RK_MSG_BLOCK = 0x4; /**< Block produce*() on message queue
+					*   full.
+					*   WARNING:
+					*   If a delivery report callback
+					*   is used the application MUST
+					*   call rd_kafka_poll() (or equiv.)
+					*   to make sure delivered messages
+					*   are drained from the internal
+					*   delivery report queue.
+					*   Failure to do so will result
+					*   in indefinately blocking on
+					*   the produce() call when the
+					*   message queue is full.
+					*/
+
 
   /**@cond NO_DOC*/
   /* For backwards compatibility: */
@@ -1600,6 +1640,16 @@ class RD_EXPORT Producer : public virtual Handle {
    *   - a fixed partition (0..N)
    *
    * \p msgflags is zero or more of the following flags OR:ed together:
+   *    RK_MSG_BLOCK - block \p produce*() call if
+   *                   \p queue.buffering.max.messages or
+   *                   \p queue.buffering.max.kbytes are exceeded.
+   *                   Messages are considered in-queue from the point they
+   *                   are accepted by produce() until their corresponding
+   *                   delivery report callback/event returns.
+   *                   It is thus a requirement to call 
+   *                   poll() (or equiv.) from a separate
+   *                   thread when RK_MSG_BLOCK is used.
+   *                   See WARNING on \c RK_MSG_BLOCK above.
    *    RK_MSG_FREE - rdkafka will free(3) \p payload when it is done with it.
    *    RK_MSG_COPY - the \p payload data will be copied and the \p payload
    *               pointer will not be used by rdkafka after the
@@ -1658,6 +1708,20 @@ class RD_EXPORT Producer : public virtual Handle {
                              const std::vector<char> *payload,
                              const std::vector<char> *key,
                              void *msg_opaque) = 0;
+
+
+  /**
+   * @brief Wait until all outstanding produce requests, et.al, are completed.
+   *        This should typically be done prior to destroying a producer instance
+   *        to make sure all queued and in-flight produce requests are completed
+   *        before terminating.
+   *
+   * @remark This function will call poll() and thus trigger callbacks.
+   *
+   * @returns ERR__TIMED_OUT if \p timeout_ms was reached before all
+   *          outstanding requests were completed, else ERR_NO_ERROR
+   */
+  virtual ErrorCode flush (int timeout_ms) = 0;
 };
 
 /**@}*/
