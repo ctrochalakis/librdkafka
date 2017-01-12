@@ -25,3 +25,5 @@ gmon.out
 *.rpm
 staging-docs
 tmp
+dest
+artifacts
