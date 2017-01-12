@@ -1,5 +1,7 @@
 language: c
 cache: ccache
+env:
+- ARCH=x64
 compiler:
 - gcc
 - clang
@@ -26,7 +28,10 @@ deploy:
   region: us-west-1
   skip_cleanup: true
   local-dir: artifacts
-  upload-dir: travis-${TRAVIS_COMMIT}-${TRAVIS_BUILD_ID}
+  upload-dir: travis-${TRAVIS_OS_NAME}-${ARCH}-tag_$TRAVIS{TRAVIS_TAG}-${TRAVIS_COMMIT}-${TRAVIS_BUILD_ID}
   on:
+    condition: $CC = gcc
+    condition: $TRAVIS_PULL_REQUEST = false
     repo: edenhill/librdkafka
     branch: ci-s3-test
+    #tags: true  ## for tag builds only
