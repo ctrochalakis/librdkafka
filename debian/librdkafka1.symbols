@@ -15,6 +15,8 @@ librdkafka.so.1 librdkafka1 #MINVER#
  rd_kafka_conf_new@Base 0.8.0
  rd_kafka_conf_properties_show@Base 0.8.0
  rd_kafka_conf_set@Base 0.8.0
+ rd_kafka_conf_set_closesocket_cb@Base 0.9.3
+ rd_kafka_conf_set_connect_cb@Base 0.9.3
  rd_kafka_conf_set_consume_cb@Base 0.9.0
  rd_kafka_conf_set_default_topic_conf@Base 0.9.0
  rd_kafka_conf_set_dr_cb@Base 0.8.0
