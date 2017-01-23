@@ -58,7 +58,6 @@ static RD_UNUSED void rd_kafka_offset_stats_reset (struct offset_stats *offs) {
  * Topic + Partition combination
  */
 struct rd_kafka_toppar_s { /* rd_kafka_toppar_t */
-        int rktp_removed;
 	TAILQ_ENTRY(rd_kafka_toppar_s) rktp_rklink;  /* rd_kafka_t link */
 	TAILQ_ENTRY(rd_kafka_toppar_s) rktp_rkblink; /* rd_kafka_broker_t link*/
         CIRCLEQ_ENTRY(rd_kafka_toppar_s) rktp_fetchlink; /* rkb_fetch_toppars */
@@ -87,13 +86,53 @@ struct rd_kafka_toppar_s { /* rd_kafka_toppar_t */
         int                rktp_fetch;     /* On rkb_fetch_toppars list */
 
 	/* Consumer */
-	rd_kafka_q_t       rktp_fetchq;          /* Queue of fetched messages
+	rd_kafka_q_t      *rktp_fetchq;          /* Queue of fetched messages
 						  * from broker.
                                                   * Broker thread -> App */
-        rd_kafka_q_t       rktp_ops;             /* * -> Broker thread */
+        rd_kafka_q_t      *rktp_ops;             /* * -> Main thread */
 
+
+	/**
+	 * rktp version barriers
+	 *
+	 * rktp_version is the application/controller side's
+	 * authoritative version, it depicts the most up to date state.
+	 * This is what q_filter() matches an rko_version to.
+	 *
+	 * rktp_op_version is the last/current received state handled
+	 * by the toppar in the broker thread. It is updated to rktp_version
+	 * when receiving a new op.
+	 *
+	 * rktp_fetch_version is the current fetcher decision version.
+	 * It is used in fetch_decide() to see if the fetch decision
+	 * needs to be updated by comparing to rktp_op_version.
+	 *
+	 * Example:
+	 *   App thread   : Send OP_START (v1 bump): rktp_version=1
+	 *   Broker thread: Recv OP_START (v1): rktp_op_version=1
+	 *   Broker thread: fetch_decide() detects that
+	 *                  rktp_op_version != rktp_fetch_version and
+	 *                  sets rktp_fetch_version=1.
+	 *   Broker thread: next Fetch request has it's tver state set to
+	 *                  rktp_fetch_verison (v1).
+	 *
+	 *   App thread   : Send OP_SEEK (v2 bump): rktp_version=2
+	 *   Broker thread: Recv OP_SEEK (v2): rktp_op_version=2
+	 *   Broker thread: Recv IO FetchResponse with tver=1,
+	 *                  when enqueued on rktp_fetchq they're discarded
+	 *                  due to old version (tver<rktp_version).
+	 *   Broker thread: fetch_decide() detects version change and
+	 *                  sets rktp_fetch_version=2.
+	 *   Broker thread: next Fetch request has tver=2
+	 *   Broker thread: Recv IO FetchResponse with tver=2 which
+	 *                  is same as rktp_version so message is forwarded
+	 *                  to app.
+	 */
         rd_atomic32_t      rktp_version;         /* Latest op version.
                                                   * Authoritative (app thread)*/
+	int32_t            rktp_op_version;      /* Op version of curr command
+						  * state from.
+						  * (broker thread) */
         int32_t            rktp_fetch_version;   /* Op version of curr fetch.
                                                     (broker thread) */
 
@@ -109,11 +148,18 @@ struct rd_kafka_toppar_s { /* rd_kafka_toppar_t */
 #define RD_KAFKA_TOPPAR_FETCH_IS_STARTED(fetch_state) \
         ((fetch_state) >= RD_KAFKA_TOPPAR_FETCH_OFFSET_QUERY)
 
+	int32_t            rktp_fetch_msg_max_bytes; /* Max number of bytes to
+                                                      * fetch.
+                                                      * Locality: broker thread
+                                                      */
 
 	int64_t            rktp_query_offset;    /* Offset to query broker for*/
 	int64_t            rktp_next_offset;     /* Next offset to start
                                                   * fetching from.
                                                   * Locality: toppar thread */
+	int64_t            rktp_last_next_offset; /* Last next_offset handled
+						   * by fetch_decide().
+						   * Locality: broker thread */
 	int64_t            rktp_app_offset;      /* Last offset delivered to
 						  * application + 1 */
 	int64_t            rktp_stored_offset;   /* Last stored offset, but
@@ -150,9 +196,10 @@ struct rd_kafka_toppar_s { /* rd_kafka_toppar_t */
 
         int                rktp_assigned;   /* Partition in cgrp assignment */
 
-        rd_kafka_q_t      *rktp_replyq;     /* Current replyq for propagating
-                                             * major operations, e.g.,
-                                             * FETCH_STOP. */
+        rd_kafka_replyq_t  rktp_replyq; /* Current replyq+version
+					 * for propagating
+					 * major operations, e.g.,
+					 * FETCH_STOP. */
         //LOCK: toppar_lock().  RD_KAFKA_TOPPAR_F_DESIRED
         //LOCK: toppar_lock().  RD_KAFKA_TOPPAR_F_UNKNOWN
 	int                rktp_flags;
@@ -164,6 +211,7 @@ struct rd_kafka_toppar_s { /* rd_kafka_toppar_t */
 #define RD_KAFKA_TOPPAR_F_OFFSET_STORE_STOPPING 0x8 /* Offset store stopping */
 #define RD_KAFKA_TOPPAR_F_APP_PAUSE  0x10   /* App pause()d consumption */
 #define RD_KAFKA_TOPPAR_F_LIB_PAUSE  0x20   /* librdkafka paused consumption */
+#define RD_KAFKA_TOPPAR_F_REMOVE     0x40   /* partition removed from cluster */
 
         shptr_rd_kafka_toppar_t *rktp_s_for_desp; /* Shared pointer for
                                                    * rkt_desp list */
@@ -215,6 +263,10 @@ struct rd_kafka_toppar_s { /* rd_kafka_toppar_t */
 #define rd_kafka_toppar_keep(rktp)                                      \
         rd_shared_ptr_get(rktp, &(rktp)->rktp_refcnt, shptr_rd_kafka_toppar_t)
 
+#define rd_kafka_toppar_keep_src(func,line,rktp)			\
+        rd_shared_ptr_get_src(func, line, rktp,				\
+			      &(rktp)->rktp_refcnt, shptr_rd_kafka_toppar_t)
+
 
 /**
  * Frees a shared pointer previously returned by ..toppar_keep()
@@ -242,10 +294,12 @@ static const char *rd_kafka_toppar_name (const rd_kafka_toppar_t *rktp) {
 
 	return ret;
 }
-shptr_rd_kafka_toppar_t *rd_kafka_toppar_new (rd_kafka_itopic_t *rkt,
-                                              int32_t partition);
+shptr_rd_kafka_toppar_t *rd_kafka_toppar_new0 (rd_kafka_itopic_t *rkt,
+					       int32_t partition,
+					       const char *func, int line);
+#define rd_kafka_toppar_new(rkt,partition) \
+	rd_kafka_toppar_new0(rkt, partition, __FUNCTION__, __LINE__)
 void rd_kafka_toppar_destroy_final (rd_kafka_toppar_t *rktp);
-void rd_kafka_toppar_remove (rd_kafka_toppar_t *rktp);
 void rd_kafka_toppar_purge_queues (rd_kafka_toppar_t *rktp);
 void rd_kafka_toppar_set_fetch_state (rd_kafka_toppar_t *rktp,
                                       int fetch_state);
@@ -256,7 +310,6 @@ void rd_kafka_toppar_insert_msgq (rd_kafka_toppar_t *rktp,
 				  rd_kafka_msgq_t *rkmq);
 void rd_kafka_toppar_concat_msgq (rd_kafka_toppar_t *rktp,
 				  rd_kafka_msgq_t *rkmq);
-void rd_kafka_toppar_move_msgs (rd_kafka_toppar_t *dst, rd_kafka_toppar_t *src);
 void rd_kafka_toppar_enq_error (rd_kafka_toppar_t *rktp,
                                 rd_kafka_resp_err_t err);
 shptr_rd_kafka_toppar_t *rd_kafka_toppar_get (const rd_kafka_itopic_t *rkt,
@@ -275,6 +328,7 @@ rd_kafka_toppar_get_avail (const rd_kafka_itopic_t *rkt,
 
 shptr_rd_kafka_toppar_t *rd_kafka_toppar_desired_get (rd_kafka_itopic_t *rkt,
                                                       int32_t partition);
+void rd_kafka_toppar_desired_add0 (rd_kafka_toppar_t *rktp);
 shptr_rd_kafka_toppar_t *rd_kafka_toppar_desired_add (rd_kafka_itopic_t *rkt,
                                                       int32_t partition);
 void rd_kafka_toppar_desired_link (rd_kafka_toppar_t *rktp);
@@ -290,29 +344,24 @@ void rd_kafka_toppar_offset_commit (rd_kafka_toppar_t *rktp, int64_t offset,
 				    const char *metadata);
 
 void rd_kafka_toppar_broker_delegate (rd_kafka_toppar_t *rktp,
-				      rd_kafka_broker_t *rkb);
-void rd_kafka_toppar_op (rd_kafka_toppar_t *rktp, rd_kafka_op_type_t type,
-                         int64_t offset, rd_kafka_cgrp_t *rkcg,
-                         rd_kafka_q_t *replyq);
+				      rd_kafka_broker_t *rkb,
+				      int for_removal);
 
-void rd_kafka_toppar_fetch_start (rd_kafka_toppar_t *rktp,
-				  int64_t offset, rd_kafka_op_t *rko_orig);
-void rd_kafka_toppar_fetch_stop (rd_kafka_toppar_t *rktp,
-				 rd_kafka_op_t *rko_orig);
-void rd_kafka_toppar_seek (rd_kafka_toppar_t *rktp,
-			   int64_t offset, rd_kafka_op_t *rko_orig);
 
 rd_kafka_resp_err_t rd_kafka_toppar_op_fetch_start (rd_kafka_toppar_t *rktp,
                                                     int64_t offset,
                                                     rd_kafka_q_t *fwdq,
-                                                    rd_kafka_q_t *replyq);
+                                                    rd_kafka_replyq_t replyq);
 
 rd_kafka_resp_err_t rd_kafka_toppar_op_fetch_stop (rd_kafka_toppar_t *rktp,
-                                                   rd_kafka_q_t *replyq);
+                                                   rd_kafka_replyq_t replyq);
 
 rd_kafka_resp_err_t rd_kafka_toppar_op_seek (rd_kafka_toppar_t *rktp,
                                              int64_t offset,
-                                             rd_kafka_q_t *replyq);
+                                             rd_kafka_replyq_t replyq);
+
+rd_kafka_resp_err_t rd_kafka_toppar_op_pause (rd_kafka_toppar_t *rktp,
+					      int pause, int flag);
 
 void rd_kafka_toppar_fetch_stopped (rd_kafka_toppar_t *rktp,
                                     rd_kafka_resp_err_t err);
@@ -346,7 +395,7 @@ void rd_kafka_broker_consumer_toppar_serve (rd_kafka_broker_t *rkb,
 
 
 void rd_kafka_toppar_offset_fetch (rd_kafka_toppar_t *rktp,
-                                   rd_kafka_q_t *replyq);
+                                   rd_kafka_replyq_t replyq);
 
 void rd_kafka_toppar_offset_request (rd_kafka_toppar_t *rktp,
 				     int64_t query_offset, int backoff_ms);
@@ -365,10 +414,15 @@ rd_kafka_toppars_pause_resume (rd_kafka_t *rk, int pause, int flag,
 			       rd_kafka_topic_partition_list_t *partitions);
 
 
+rd_kafka_topic_partition_t *rd_kafka_topic_partition_new (const char *topic,
+							  int32_t partition);
+rd_kafka_topic_partition_t *
+rd_kafka_topic_partition_new_from_rktp (rd_kafka_toppar_t *rktp);
+
 rd_kafka_topic_partition_t *
 rd_kafka_topic_partition_list_add0 (rd_kafka_topic_partition_list_t *rktparlist,
                                     const char *topic, int32_t partition,
-                                    void *_private);
+				    shptr_rd_kafka_toppar_t *_private);
 
 int rd_kafka_topic_partition_match (rd_kafka_t *rk,
 				    const rd_kafka_group_member_t *rkgm,
@@ -399,7 +453,15 @@ void
 rd_kafka_topic_partition_list_log (rd_kafka_t *rk, const char *fac,
 				   const rd_kafka_topic_partition_list_t *rktparlist);
 
+void
+rd_kafka_topic_partition_list_update (rd_kafka_topic_partition_list_t *dst,
+                                      const rd_kafka_topic_partition_list_t *src);
+int
 
+rd_kafka_topic_partition_list_sum (
+        const rd_kafka_topic_partition_list_t *rktparlist,
+        int (*cb) (const rd_kafka_topic_partition_t *rktpar, void *opaque),
+        void *opaque);
 
 /**
  * @brief Toppar + Op version tuple used for mapping Fetched partitions
@@ -436,3 +498,29 @@ static RD_INLINE RD_UNUSED
 void rd_kafka_toppar_ver_destroy (struct rd_kafka_toppar_ver *tver) {
 	rd_kafka_toppar_destroy(tver->s_rktp);
 }
+
+
+/**
+ * @returns 1 if rko version is outdated, else 0.
+ */
+static RD_INLINE RD_UNUSED
+int rd_kafka_op_version_outdated (rd_kafka_op_t *rko, int version) {
+	if (!rko->rko_version)
+		return 0;
+
+	if (version)
+		return rko->rko_version < version;
+
+	if (rko->rko_rktp)
+		return rko->rko_version <
+			rd_atomic32_get(&rd_kafka_toppar_s2i(
+						rko->rko_rktp)->rktp_version);
+	return 0;
+}
+
+void
+rd_kafka_toppar_offset_commit_result (rd_kafka_toppar_t *rktp,
+				      rd_kafka_resp_err_t err,
+				      rd_kafka_topic_partition_list_t *offsets);
+
+void rd_kafka_toppar_broker_leave_for_remove (rd_kafka_toppar_t *rktp);

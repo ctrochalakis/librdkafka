@@ -33,27 +33,42 @@
 #include "rdkafka_partition.h"
 #include "rdkafka_assignor.h"
 #include "rdkafka_offset.h"
+#include "rdkafka_metadata.h"
 #include "rdkafka_cgrp.h"
 
-static void rd_kafka_cgrp_check_unassign_done (rd_kafka_cgrp_t *rkcg);
+static void rd_kafka_cgrp_check_unassign_done (rd_kafka_cgrp_t *rkcg,
+                                               const char *reason);
 static void rd_kafka_cgrp_offset_commit_tmr_cb (rd_kafka_timers_t *rkts,
                                                 void *arg);
 static void rd_kafka_cgrp_assign (rd_kafka_cgrp_t *rkcg,
 				  rd_kafka_topic_partition_list_t *assignment);
 static rd_kafka_resp_err_t rd_kafka_cgrp_unassign (rd_kafka_cgrp_t *rkcg);
 static void
-rd_kafka_cgrp_partitions_fetch_start (rd_kafka_cgrp_t *rkcg,
-                                      rd_kafka_topic_partition_list_t
-                                      *assignment, int usable_offsets);
+rd_kafka_cgrp_partitions_fetch_start0 (rd_kafka_cgrp_t *rkcg,
+				       rd_kafka_topic_partition_list_t
+				       *assignment, int usable_offsets,
+				       int line);
+#define rd_kafka_cgrp_partitions_fetch_start(rkcg,assignment,usable_offsets) \
+	rd_kafka_cgrp_partitions_fetch_start0(rkcg,assignment,usable_offsets,\
+					      __LINE__)
 
 /**
  * @returns true if cgrp can start partition fetchers, which is true if
  *          there is a subscription and the group is fully joined, or there
- *          is no subscription (in which case the join state is irrelevant) - 
+ *          is no subscription (in which case the join state is irrelevant)
  *          such as for an assign() without subscribe(). */
 #define RD_KAFKA_CGRP_CAN_FETCH_START(rkcg) \
-	(!((rkcg)->rkcg_flags & RD_KAFKA_CGRP_F_SUBSCRIPTION) ||	\
-	 ((rkcg)->rkcg_join_state == RD_KAFKA_CGRP_JOIN_STATE_ASSIGNED))
+	((rkcg)->rkcg_join_state == RD_KAFKA_CGRP_JOIN_STATE_ASSIGNED)
+
+/**
+ * @returns true if cgrp is waiting for a rebalance_cb to be handled by
+ *          the application.
+ */
+#define RD_KAFKA_CGRP_WAIT_REBALANCE_CB(rkcg)			\
+	((rkcg)->rkcg_join_state ==				\
+	 RD_KAFKA_CGRP_JOIN_STATE_WAIT_ASSIGN_REBALANCE_CB ||	\
+	 (rkcg)->rkcg_join_state ==				\
+	 RD_KAFKA_CGRP_JOIN_STATE_WAIT_REVOKE_REBALANCE_CB)
 
 
 const char *rd_kafka_cgrp_state_names[] = {
@@ -72,8 +87,10 @@ const char *rd_kafka_cgrp_join_state_names[] = {
         "wait-metadata",
         "wait-sync",
         "wait-unassign",
-        "wait-rebalance_cb",
-        "assigned"
+        "wait-assign-rebalance_cb",
+	"wait-revoke-rebalance_cb",
+        "assigned",
+	"started"
 };
 
 
@@ -82,27 +99,48 @@ static void rd_kafka_cgrp_set_state (rd_kafka_cgrp_t *rkcg, int state) {
                 return;
 
         rd_kafka_dbg(rkcg->rkcg_rk, CGRP, "CGRPSTATE",
-                     "Group \"%.*s\" changed state %s -> %s",
+                     "Group \"%.*s\" changed state %s -> %s "
+                     "(v%d, join-state %s)",
                      RD_KAFKAP_STR_PR(rkcg->rkcg_group_id),
                      rd_kafka_cgrp_state_names[rkcg->rkcg_state],
-                     rd_kafka_cgrp_state_names[state]);
+                     rd_kafka_cgrp_state_names[state],
+		     rkcg->rkcg_version,
+                     rd_kafka_cgrp_join_state_names[rkcg->rkcg_join_state]);
         rkcg->rkcg_state = state;
         rkcg->rkcg_ts_statechange = rd_clock();
+
+	rd_kafka_brokers_broadcast_state_change(rkcg->rkcg_rk);
 }
 
 
-void rd_kafka_cgrp_set_join_state (rd_kafka_cgrp_t *rkcg, int join_state){
+void rd_kafka_cgrp_set_join_state (rd_kafka_cgrp_t *rkcg, int join_state) {
         if ((int)rkcg->rkcg_join_state == join_state)
                 return;
 
         rd_kafka_dbg(rkcg->rkcg_rk, CGRP, "CGRPJOINSTATE",
-                     "Group \"%.*s\" changed join state %s -> %s",
+                     "Group \"%.*s\" changed join state %s -> %s "
+                     "(v%d, state %s)",
                      RD_KAFKAP_STR_PR(rkcg->rkcg_group_id),
                      rd_kafka_cgrp_join_state_names[rkcg->rkcg_join_state],
-                     rd_kafka_cgrp_join_state_names[join_state]);
+                     rd_kafka_cgrp_join_state_names[join_state],
+		     rkcg->rkcg_version,
+                     rd_kafka_cgrp_state_names[rkcg->rkcg_state]);
         rkcg->rkcg_join_state = join_state;
 }
 
+
+static RD_INLINE void
+rd_kafka_cgrp_version_new_barrier0 (rd_kafka_cgrp_t *rkcg,
+				    const char *func, int line) {
+	rkcg->rkcg_version++;
+	rd_kafka_dbg(rkcg->rkcg_rk, CGRP, "BARRIER",
+		     "Group \"%.*s\": %s:%d: new version barrier v%d",
+		     RD_KAFKAP_STR_PR(rkcg->rkcg_group_id), func, line,
+		     rkcg->rkcg_version);
+}
+
+#define rd_kafka_cgrp_version_new_barrier(rkcg) \
+	rd_kafka_cgrp_version_new_barrier0(rkcg, __FUNCTION__, __LINE__)
 
 
 void rd_kafka_cgrp_destroy_final (rd_kafka_cgrp_t *rkcg) {
@@ -111,12 +149,14 @@ void rd_kafka_cgrp_destroy_final (rd_kafka_cgrp_t *rkcg) {
         rd_kafka_assert(rkcg->rkcg_rk, !rkcg->rkcg_group_leader.members);
         rd_kafka_cgrp_set_member_id(rkcg, NULL);
 
-        rd_kafka_q_destroy(&rkcg->rkcg_q);
-        rd_kafka_q_destroy(&rkcg->rkcg_ops);
+        rd_kafka_q_destroy(rkcg->rkcg_q);
+        rd_kafka_q_destroy(rkcg->rkcg_ops);
+	rd_kafka_q_destroy(rkcg->rkcg_wait_coord_q);
         rd_kafka_assert(rkcg->rkcg_rk, TAILQ_EMPTY(&rkcg->rkcg_topics));
         rd_kafka_assert(rkcg->rkcg_rk, rd_list_empty(&rkcg->rkcg_toppars));
         rd_list_destroy(&rkcg->rkcg_toppars, NULL);
-
+	rd_list_destroy(rkcg->rkcg_subscribed_topics,
+			(void *)rd_kafka_topic_info_destroy);
         rd_free(rkcg);
 }
 
@@ -135,17 +175,20 @@ rd_kafka_cgrp_t *rd_kafka_cgrp_new (rd_kafka_t *rk,
         rkcg->rkcg_client_id = client_id;
         rkcg->rkcg_coord_id = -1;
         rkcg->rkcg_generation_id = -1;
+	rkcg->rkcg_version = 1;
 
         mtx_init(&rkcg->rkcg_lock, mtx_plain);
-        rd_kafka_q_init(&rkcg->rkcg_ops, rk);
-        rd_kafka_q_init(&rkcg->rkcg_q, rk);
-	rd_kafka_q_init(&rkcg->rkcg_wait_coord_q, rk);
+        rkcg->rkcg_ops = rd_kafka_q_new(rk);
+        rkcg->rkcg_q = rd_kafka_q_new(rk);
+	rkcg->rkcg_wait_coord_q = rd_kafka_q_new(rk);
         TAILQ_INIT(&rkcg->rkcg_topics);
         rd_list_init(&rkcg->rkcg_toppars, 32);
         rd_kafka_cgrp_set_member_id(rkcg, "");
+	rkcg->rkcg_subscribed_topics = rd_list_new(0);
         rd_interval_init(&rkcg->rkcg_coord_query_intvl);
         rd_interval_init(&rkcg->rkcg_heartbeat_intvl);
         rd_interval_init(&rkcg->rkcg_join_intvl);
+        rd_interval_init(&rkcg->rkcg_timeout_scan_intvl);
 
         if (RD_KAFKAP_STR_IS_NULL(group_id)) {
                 /* No group configured: Operate in legacy/SimpleConsumer mode */
@@ -159,7 +202,7 @@ rd_kafka_cgrp_t *rd_kafka_cgrp_new (rd_kafka_t *rk,
                 rd_kafka_timer_start(&rk->rk_timers,
                                      &rkcg->rkcg_offset_commit_tmr,
                                      rk->rk_conf.
-				     auto_commit_interval_ms * 1000,
+				     auto_commit_interval_ms * 1000ll,
                                      rd_kafka_cgrp_offset_commit_tmr_cb,
                                      rkcg);
 
@@ -416,15 +459,21 @@ err2:
 
         if (ErrorCode == RD_KAFKA_RESP_ERR_GROUP_COORDINATOR_NOT_AVAILABLE)
                 rd_kafka_cgrp_coord_update(rkcg, -1);
-	else if (rkcg->rkcg_last_err != ErrorCode) {
-                rd_kafka_op_app_fmt(&rkcg->rkcg_q, RD_KAFKA_OP_CONSUMER_ERR,
-                                    NULL, ErrorCode,
-                                    "GroupCoordinator response error: %s",
-                                    rd_kafka_err2str(ErrorCode));
-		/* Suppress repeated errors */
-                rkcg->rkcg_last_err = ErrorCode;
-        }
+	else {
+                if (rkcg->rkcg_last_err != ErrorCode) {
+                        rd_kafka_q_op_err(rkcg->rkcg_q,
+                                          RD_KAFKA_OP_CONSUMER_ERR,
+                                          ErrorCode, 0, NULL, 0,
+                                          "GroupCoordinator response error: %s",
+                                          rd_kafka_err2str(ErrorCode));
 
+                        /* Suppress repeated errors */
+                        rkcg->rkcg_last_err = ErrorCode;
+                }
+
+		/* Continue querying */
+		rd_kafka_cgrp_set_state(rkcg, RD_KAFKA_CGRP_STATE_QUERY_COORD);
+        }
 }
 
 
@@ -456,7 +505,7 @@ void rd_kafka_cgrp_coord_query (rd_kafka_cgrp_t *rkcg,
                    RD_KAFKAP_STR_PR(rkcg->rkcg_group_id), reason);
 
         rd_kafka_GroupCoordinatorRequest(rkb, rkcg->rkcg_group_id,
-                                         &rkcg->rkcg_ops,
+                                         RD_KAFKA_REPLYQ(rkcg->rkcg_ops, 0),
                                          rd_kafka_cgrp_handle_GroupCoordinator,
                                          rkcg);
 
@@ -476,7 +525,9 @@ static void rd_kafka_cgrp_leave (rd_kafka_cgrp_t *rkcg, int ignore_response) {
         if (rkcg->rkcg_state == RD_KAFKA_CGRP_STATE_UP)
                 rd_kafka_LeaveGroupRequest(rkcg->rkcg_rkb, rkcg->rkcg_group_id,
                                            rkcg->rkcg_member_id,
-                                           &rkcg->rkcg_ops,
+					   ignore_response ?
+					   RD_KAFKA_NO_REPLYQ :
+                                           RD_KAFKA_REPLYQ(rkcg->rkcg_ops, 0),
                                            ignore_response ? NULL :
                                            rd_kafka_handle_LeaveGroup, rkcg);
         else if (!ignore_response)
@@ -485,33 +536,231 @@ static void rd_kafka_cgrp_leave (rd_kafka_cgrp_t *rkcg, int ignore_response) {
                                            NULL, NULL, rkcg);
 }
 
+
+/**
+ * Enqueue a rebalance op (if configured). 'partitions' is copied.
+ * This delegates the responsibility of assign() and unassign() to the
+ * application.
+ *
+ * Returns 1 if a rebalance op was enqueued, else 0.
+ * Returns 0 if there was no rebalance_cb or 'assignment' is NULL,
+ * in which case rd_kafka_cgrp_assign(rkcg,assignment) is called immediately.
+ */
+static int
+rd_kafka_rebalance_op (rd_kafka_cgrp_t *rkcg,
+		       rd_kafka_resp_err_t err,
+		       rd_kafka_topic_partition_list_t *assignment,
+		       const char *reason) {
+	rd_kafka_op_t *rko;
+
+        rd_kafka_wrlock(rkcg->rkcg_rk);
+        rkcg->rkcg_c.ts_rebalance = rd_clock();
+        rkcg->rkcg_c.rebalance_cnt++;
+        rd_kafka_wrunlock(rkcg->rkcg_rk);
+
+	/* Pause current partition set consumers until new assign() is called */
+	if (rkcg->rkcg_assignment)
+		rd_kafka_toppars_pause_resume(rkcg->rkcg_rk, 1,
+					      RD_KAFKA_TOPPAR_F_LIB_PAUSE,
+					      rkcg->rkcg_assignment);
+
+	if (!(rkcg->rkcg_rk->rk_conf.enabled_events & RD_KAFKA_EVENT_REBALANCE)
+	    || !assignment) {
+	no_delegation:
+		if (err == RD_KAFKA_RESP_ERR__ASSIGN_PARTITIONS)
+			rd_kafka_cgrp_assign(rkcg, assignment);
+		else
+			rd_kafka_cgrp_unassign(rkcg);
+		return 0;
+	}
+
+	rd_kafka_dbg(rkcg->rkcg_rk, CGRP, "ASSIGN",
+		     "Group \"%s\": delegating %s of %d partition(s) "
+		     "to application rebalance callback on queue %s: %s",
+		     rkcg->rkcg_group_id->str,
+		     err == RD_KAFKA_RESP_ERR__REVOKE_PARTITIONS ?
+		     "revoke":"assign", assignment->cnt,
+		     rd_kafka_q_dest_name(rkcg->rkcg_q), reason);
+
+	rd_kafka_cgrp_set_join_state(
+		rkcg,
+		err == RD_KAFKA_RESP_ERR__ASSIGN_PARTITIONS ?
+		RD_KAFKA_CGRP_JOIN_STATE_WAIT_ASSIGN_REBALANCE_CB :
+		RD_KAFKA_CGRP_JOIN_STATE_WAIT_REVOKE_REBALANCE_CB);
+
+	rko = rd_kafka_op_new(RD_KAFKA_OP_REBALANCE);
+	rko->rko_err = err;
+	rko->rko_u.rebalance.partitions =
+		rd_kafka_topic_partition_list_copy(assignment);
+
+	if (rd_kafka_q_enq(rkcg->rkcg_q, rko) == 0) {
+		/* Queue disabled, handle assignment here. */
+		goto no_delegation;
+	}
+
+	return 1;
+}
+
+
+
 static void rd_kafka_cgrp_join (rd_kafka_cgrp_t *rkcg) {
+	int metadata_age;
 
         if (rkcg->rkcg_state != RD_KAFKA_CGRP_STATE_UP ||
             rkcg->rkcg_join_state != RD_KAFKA_CGRP_JOIN_STATE_INIT)
                 return;
 
-        rd_kafka_dbg(rkcg->rkcg_rk, CGRP, "JOIN",
-                     "Group \"%.*s\": join with %d subscribed topic(s)",
+	rd_kafka_dbg(rkcg->rkcg_rk, CGRP, "JOIN",
+                     "Group \"%.*s\": join with %d (%d) subscribed topic(s)",
                      RD_KAFKAP_STR_PR(rkcg->rkcg_group_id),
-                     rkcg->rkcg_subscription->cnt);
+                     rd_list_cnt(rkcg->rkcg_subscribed_topics),
+		     rkcg->rkcg_subscription->cnt);
+
+
+	/* We need up-to-date full metadata to continue.
+	 * The +1000 is since metadata.refresh.interval.ms can be set to 0. */
+	metadata_age = rkcg->rkcg_rk->rk_ts_full_metadata ?
+		(int)(rd_clock() - rkcg->rkcg_rk->rk_ts_full_metadata)/1000 :-1;
+	if (metadata_age == -1 ||
+	    metadata_age >
+	    rkcg->rkcg_rk->rk_conf.metadata_refresh_interval_ms + 1000) {
+		rd_kafka_dbg(rkcg->rkcg_rk, CGRP, "JOIN",
+			     "Group \"%.*s\": "
+			     "postponing join until full metadata is available"
+			     " (current metadata age %dms > "
+			     "metadata.max.age.ms %dms)",
+			     RD_KAFKAP_STR_PR(rkcg->rkcg_group_id),
+			     metadata_age,
+			     rkcg->rkcg_rk->rk_conf.
+			     metadata_refresh_interval_ms);
+
+		/* Trigger metadata request */
+		rd_kafka_metadata0(rkcg->rkcg_rk, 1 /* all topics */, NULL,
+				   RD_KAFKA_NO_REPLYQ, "consumer join");
+		return;
+	}
+
+	if (rd_list_empty(rkcg->rkcg_subscribed_topics)) {
+		rd_kafka_dbg(rkcg->rkcg_rk, CGRP, "JOIN",
+			     "Group \"%.*s\": "
+			     "no matching topics based on %dms old metadata: "
+			     "next metadata refresh in %dms",
+			     RD_KAFKAP_STR_PR(rkcg->rkcg_group_id),
+			     metadata_age,
+			     rkcg->rkcg_rk->rk_conf.
+			     metadata_refresh_interval_ms - metadata_age);
+		return;
+	}
 
         rd_kafka_cgrp_set_join_state(rkcg, RD_KAFKA_CGRP_JOIN_STATE_WAIT_JOIN);
         rd_kafka_JoinGroupRequest(rkcg->rkcg_rkb, rkcg->rkcg_group_id,
                                   rkcg->rkcg_member_id,
                                   rkcg->rkcg_rk->rk_conf.group_protocol_type,
-                                  rkcg->rkcg_subscription,
-                                  &rkcg->rkcg_ops,
+                                  rkcg->rkcg_subscribed_topics,
+                                  RD_KAFKA_REPLYQ(rkcg->rkcg_ops, 0),
                                   rd_kafka_cgrp_handle_JoinGroup, rkcg);
 }
+
+/**
+ * Rejoin group on update to effective subscribed topics list
+ */
+static void rd_kafka_cgrp_rejoin (rd_kafka_cgrp_t *rkcg) {
+        /*
+         * Clean-up group leader duties, if any.
+         */
+        rd_kafka_cgrp_group_leader_reset(rkcg);
+
+        /* Remove assignment (async), if any. If there is already an
+         * unassign in progress we dont need to bother. */
+        if (rkcg->rkcg_assignment) {
+		if (!(rkcg->rkcg_flags & RD_KAFKA_CGRP_F_WAIT_UNASSIGN)) {
+			rkcg->rkcg_flags |= RD_KAFKA_CGRP_F_WAIT_UNASSIGN;
+
+			rd_kafka_rebalance_op(
+				rkcg,
+				RD_KAFKA_RESP_ERR__REVOKE_PARTITIONS,
+				rkcg->rkcg_assignment, "unsubscribe");
+		}
+	} else {
+		rd_kafka_cgrp_join(rkcg);
+	}
+}
+
+/**
+ * Update the effective list of subscribed topics and trigger a rejoin
+ * if it changed.
+ *
+ * Set \p topics to NULL for clearing the list.
+ *
+ * @returns 1 on change, else 0.
+ *
+ * @remark Takes ownership of \p topics
+ */
+static int rd_kafka_cgrp_update_subscribed_topics (rd_kafka_cgrp_t *rkcg,
+						   rd_list_t *topics) {
+	rd_kafka_topic_info_t *tinfo;
+	int i;
+
+	if (!topics) {
+		if (!rd_list_empty(rkcg->rkcg_subscribed_topics))
+			rd_kafka_dbg(rkcg->rkcg_rk, CGRP, "SUBSCRIPTION",
+				     "Group \"%.*s\": "
+				     "clearing subscribed topics list (%d)",
+				     RD_KAFKAP_STR_PR(rkcg->rkcg_group_id),
+				     rd_list_cnt(rkcg->rkcg_subscribed_topics));
+		topics = rd_list_new(0);
+
+	} else if (rd_list_cnt(topics) == 0)
+		rd_kafka_dbg(rkcg->rkcg_rk, CGRP, "SUBSCRIPTION",
+			     "Group \"%.*s\": "
+			     "no topics in metadata matched subscription",
+			     RD_KAFKAP_STR_PR(rkcg->rkcg_group_id));
+
+	/* Sort for comparison */
+	rd_list_sort(topics, rd_kafka_topic_info_cmp);
+
+	/* Compare to existing to see if anything changed. */
+	if (!rd_list_cmp(rkcg->rkcg_subscribed_topics, topics,
+			 rd_kafka_topic_info_cmp)) {
+		/* No change */
+		rd_list_destroy(topics, (void *)rd_kafka_topic_info_destroy);
+		return 0;
+	}
+
+	rd_kafka_dbg(rkcg->rkcg_rk, CGRP, "SUBSCRIPTION",
+		     "Group \"%.*s\": effective subscription list changed "
+		     "from %d to %d topic(s):",
+		     RD_KAFKAP_STR_PR(rkcg->rkcg_group_id),
+		     rd_list_cnt(rkcg->rkcg_subscribed_topics),
+		     rd_list_cnt(topics));
+
+	RD_LIST_FOREACH(tinfo, topics, i)
+		rd_kafka_dbg(rkcg->rkcg_rk, CGRP, "SUBSCRIPTION",
+			     " Topic %s with %d partition(s)",
+			     tinfo->topic, tinfo->partition_cnt);
+
+	rd_list_destroy(rkcg->rkcg_subscribed_topics,
+			(void *)rd_kafka_topic_info_destroy);
+
+	rkcg->rkcg_subscribed_topics = topics;
+
+	return 1;
+}
+
+
 
 
 static void rd_kafka_cgrp_heartbeat (rd_kafka_cgrp_t *rkcg,
                                      rd_kafka_broker_t *rkb) {
+        /* Skip heartbeat if we have one in transit */
+        if (rkcg->rkcg_flags & RD_KAFKA_CGRP_F_HEARTBEAT_IN_TRANSIT)
+                return;
+
+        rkcg->rkcg_flags |= RD_KAFKA_CGRP_F_HEARTBEAT_IN_TRANSIT;
         rd_kafka_HeartbeatRequest(rkb, rkcg->rkcg_group_id,
                                   rkcg->rkcg_generation_id,
                                   rkcg->rkcg_member_id,
-                                  &rkcg->rkcg_ops,
+                                  RD_KAFKA_REPLYQ(rkcg->rkcg_ops, 0),
                                   rd_kafka_cgrp_handle_Heartbeat, rkcg);
 }
 
@@ -523,31 +772,29 @@ static void rd_kafka_cgrp_terminated (rd_kafka_cgrp_t *rkcg) {
 	rd_kafka_assert(NULL, rkcg->rkcg_wait_unassign_cnt == 0);
 	rd_kafka_assert(NULL, rkcg->rkcg_wait_commit_cnt == 0);
 	rd_kafka_assert(NULL, !(rkcg->rkcg_flags&RD_KAFKA_CGRP_F_WAIT_UNASSIGN));
-        rd_kafka_cgrp_set_state(rkcg, RD_KAFKA_CGRP_STATE_TERM);
+        rd_kafka_assert(NULL, rkcg->rkcg_state == RD_KAFKA_CGRP_STATE_TERM);
 
         rd_kafka_timer_stop(&rkcg->rkcg_rk->rk_timers,
                             &rkcg->rkcg_offset_commit_tmr, 1/*lock*/);
 
-	rd_kafka_q_purge(&rkcg->rkcg_wait_coord_q);
+	rd_kafka_q_purge(rkcg->rkcg_wait_coord_q);
 
 	/* Disable and empty ops queue since there will be no
 	 * (broker) thread serving it anymore after the unassign_broker
 	 * below.
 	 * This prevents hang on destroy where responses are enqueued on rkcg_ops
 	 * without anything serving the queue. */
-	rd_kafka_q_disable(&rkcg->rkcg_ops);
-	rd_kafka_q_purge(&rkcg->rkcg_ops);
+	rd_kafka_q_disable(rkcg->rkcg_ops);
+	rd_kafka_q_purge(rkcg->rkcg_ops);
 
 	if (rkcg->rkcg_rkb)
 		rd_kafka_cgrp_unassign_broker(rkcg);
 
         if (rkcg->rkcg_reply_rko) {
-                rd_kafka_q_t *replyq = rkcg->rkcg_reply_rko->rko_replyq;
                 /* Signal back to application. */
-                rkcg->rkcg_reply_rko->rko_replyq = NULL;
-                rd_kafka_q_enq(replyq, rkcg->rkcg_reply_rko);
+                rd_kafka_replyq_enq(&rkcg->rkcg_reply_rko->rko_replyq,
+				    rkcg->rkcg_reply_rko, 0);
                 rkcg->rkcg_reply_rko = NULL;
-                rd_kafka_q_destroy(replyq);
         }
 }
 
@@ -559,34 +806,57 @@ static void rd_kafka_cgrp_terminated (rd_kafka_cgrp_t *rkcg) {
  */
 static RD_INLINE int rd_kafka_cgrp_try_terminate (rd_kafka_cgrp_t *rkcg) {
 
+        if (rkcg->rkcg_state == RD_KAFKA_CGRP_STATE_TERM)
+                return 1;
+
 	if (likely(!(rkcg->rkcg_flags & RD_KAFKA_CGRP_F_TERMINATE)))
 		return 0;
 
 	/* Check if wait-coord queue has timed out. */
-	if (rd_kafka_q_len(&rkcg->rkcg_wait_coord_q) > 0 &&
+	if (rd_kafka_q_len(rkcg->rkcg_wait_coord_q) > 0 &&
 	    rkcg->rkcg_ts_terminate +
 	    (rkcg->rkcg_rk->rk_conf.group_session_timeout_ms * 1000) <
 	    rd_clock()) {
-		rd_kafka_dbg(rkcg->rkcg_rk, CGRP,"CGRPTERM",
+		rd_kafka_dbg(rkcg->rkcg_rk, CGRP, "CGRPTERM",
 			     "Group \"%s\": timing out %d op(s) in "
 			     "wait-for-coordinator queue",
 			     rkcg->rkcg_group_id->str,
-			     rd_kafka_q_len(&rkcg->rkcg_wait_coord_q));
-		rd_kafka_q_disable(&rkcg->rkcg_wait_coord_q);
-		if (rd_kafka_q_concat(&rkcg->rkcg_ops,
-				      &rkcg->rkcg_wait_coord_q) == -1) {
+			     rd_kafka_q_len(rkcg->rkcg_wait_coord_q));
+		rd_kafka_q_disable(rkcg->rkcg_wait_coord_q);
+		if (rd_kafka_q_concat(rkcg->rkcg_ops,
+				      rkcg->rkcg_wait_coord_q) == -1) {
 			/* ops queue shut down, purge coord queue */
-			rd_kafka_q_purge(&rkcg->rkcg_wait_coord_q);
+			rd_kafka_q_purge(rkcg->rkcg_wait_coord_q);
 		}
 	}
 
-	if (rd_list_empty(&rkcg->rkcg_toppars) &&
+	if (!RD_KAFKA_CGRP_WAIT_REBALANCE_CB(rkcg) &&
+	    rd_list_empty(&rkcg->rkcg_toppars) &&
 	    rkcg->rkcg_wait_unassign_cnt == 0 &&
 	    rkcg->rkcg_wait_commit_cnt == 0 &&
             !(rkcg->rkcg_flags & RD_KAFKA_CGRP_F_WAIT_UNASSIGN)) {
-                rd_kafka_cgrp_terminated(rkcg);
+                /* Since we might be deep down in a 'rko' handler
+                 * called from cgrp_op_serve() we cant call terminated()
+                 * directly since it will decommission the rkcg_ops queue
+                 * that might be locked by intermediate functions.
+                 * Instead set the TERM state and let the cgrp terminate
+                 * at its own discretion. */
+                rd_kafka_cgrp_set_state(rkcg, RD_KAFKA_CGRP_STATE_TERM);
                 return 1;
         } else {
+		rd_kafka_dbg(rkcg->rkcg_rk, CGRP, "CGRPTERM",
+			     "Group \"%s\": "
+			     "waiting for %d toppar(s), %d unassignment(s), "
+			     "%d commit(s)%s (state %s, join-state %s) "
+			     "before terminating",
+			     rkcg->rkcg_group_id->str,
+			     rd_list_cnt(&rkcg->rkcg_toppars),
+			     rkcg->rkcg_wait_unassign_cnt,
+			     rkcg->rkcg_wait_commit_cnt,
+			     (rkcg->rkcg_flags & RD_KAFKA_CGRP_F_WAIT_UNASSIGN)?
+			     ", wait-unassign flag," : "",
+			     rd_kafka_cgrp_state_names[rkcg->rkcg_state],
+			     rd_kafka_cgrp_join_state_names[rkcg->rkcg_join_state]);
                 return 0;
         }
 }
@@ -664,9 +934,9 @@ static void rd_kafka_cgrp_offsets_fetch_response (
 			     rd_kafka_err2str(err));
 
 		if (err != RD_KAFKA_RESP_ERR__WAIT_COORD)
-			rd_kafka_q_op_err(&rkcg->rkcg_q,
-					  RD_KAFKA_OP_CONSUMER_ERR, err,
-					  0,
+			rd_kafka_q_op_err(rkcg->rkcg_q,
+					  RD_KAFKA_OP_CONSUMER_ERR, err, 0,
+					  NULL, 0,
 					  "Failed to fetch offsets: %s",
 					  rd_kafka_err2str(err));
 	} else {
@@ -692,7 +962,7 @@ static void rd_kafka_cgrp_offsets_fetch_response (
  */
 static void
 rd_kafka_cgrp_offsets_fetch (rd_kafka_cgrp_t *rkcg, rd_kafka_broker_t *rkb,
-                             const rd_kafka_topic_partition_list_t *offsets) {
+                             rd_kafka_topic_partition_list_t *offsets) {
 	rd_kafka_topic_partition_list_t *use_offsets;
 
 	/* Make a copy of the offsets */
@@ -702,11 +972,16 @@ rd_kafka_cgrp_offsets_fetch (rd_kafka_cgrp_t *rkcg, rd_kafka_broker_t *rkb,
 		rd_kafka_cgrp_offsets_fetch_response(
 			rkcg->rkcg_rk, rkb, RD_KAFKA_RESP_ERR__WAIT_COORD,
 			NULL, NULL, use_offsets);
-        else
+        else {
+		rd_kafka_dbg(rkcg->rkcg_rk, CGRP, "OFFSET",
+			     "Fetch %d offsets with v%d",
+			     use_offsets->cnt, rkcg->rkcg_version);
                 rd_kafka_OffsetFetchRequest(
                         rkb, 1, offsets,
-                        &rkcg->rkcg_ops, rd_kafka_cgrp_offsets_fetch_response,
+                        RD_KAFKA_REPLYQ(rkcg->rkcg_ops, rkcg->rkcg_version),
+			rd_kafka_cgrp_offsets_fetch_response,
 			use_offsets);
+	}
 
 }
 
@@ -715,17 +990,39 @@ rd_kafka_cgrp_offsets_fetch (rd_kafka_cgrp_t *rkcg, rd_kafka_broker_t *rkb,
  * Start fetching all partitions in 'assignment' (async)
  */
 static void
-rd_kafka_cgrp_partitions_fetch_start (rd_kafka_cgrp_t *rkcg,
-                                      rd_kafka_topic_partition_list_t
-                                      *assignment, int usable_offsets) {
+rd_kafka_cgrp_partitions_fetch_start0 (rd_kafka_cgrp_t *rkcg,
+				       rd_kafka_topic_partition_list_t
+				       *assignment, int usable_offsets,
+				       int line) {
         int i;
+
+	/* If waiting for offsets to commit we need that to finish first
+	 * before starting fetchers (which might fetch those stored offsets).*/
+	if (rkcg->rkcg_wait_commit_cnt > 0) {
+		rd_kafka_dbg(rkcg->rkcg_rk, CGRP, "FETCHSTART",
+			     "Group \"%s\": not starting fetchers "
+			     "for %d assigned partition(s) in join-state %s "
+			     "(usable_offsets=%s, v%"PRId32", line %d): "
+			     "waiting for %d commit(s)",
+			     rkcg->rkcg_group_id->str, assignment->cnt,
+			     rd_kafka_cgrp_join_state_names[rkcg->
+							    rkcg_join_state],
+			     usable_offsets ? "yes":"no",
+			     rkcg->rkcg_version, line,
+			     rkcg->rkcg_wait_commit_cnt);
+		return;
+	}
+
+	rd_kafka_cgrp_version_new_barrier(rkcg);
 
         rd_kafka_dbg(rkcg->rkcg_rk, CGRP, "FETCHSTART",
                      "Group \"%s\": starting fetchers for %d assigned "
-                     "partition(s) in join-state %s (usable_offsets=%s)",
+                     "partition(s) in join-state %s "
+		     "(usable_offsets=%s, v%"PRId32", line %d)",
                      rkcg->rkcg_group_id->str, assignment->cnt,
 		     rd_kafka_cgrp_join_state_names[rkcg->rkcg_join_state],
-		     usable_offsets ? "yes":"no");
+		     usable_offsets ? "yes":"no",
+		     rkcg->rkcg_version, line);
 
 	rd_kafka_topic_partition_list_log(rkcg->rkcg_rk,
 					  "FETCHSTART", assignment);
@@ -749,28 +1046,25 @@ rd_kafka_cgrp_partitions_fetch_start (rd_kafka_cgrp_t *rkcg,
                 rd_kafka_cgrp_offsets_fetch(rkcg, rkcg->rkcg_rkb, assignment);
 
         } else {
+		rd_kafka_cgrp_set_join_state(rkcg,
+					     RD_KAFKA_CGRP_JOIN_STATE_STARTED);
+
                 for (i = 0 ; i < assignment->cnt ; i++) {
                         rd_kafka_topic_partition_t *rktpar =
                                 &assignment->elems[i];
                         shptr_rd_kafka_toppar_t *s_rktp = rktpar->_private;
                         rd_kafka_toppar_t *rktp = rd_kafka_toppar_s2i(s_rktp);
 
-			if (!RD_KAFKA_OFFSET_IS_LOGICAL(rktpar->offset))
-				rd_kafka_offset_store0(rktp, rktpar->offset, 1);
-
 			if (!rktp->rktp_assigned) {
 				rktp->rktp_assigned = 1;
 				rkcg->rkcg_assigned_cnt++;
 
-				/* Forward partition's fetchq to
+				/* Start fetcher for partition and
+				 * forward partition's fetchq to
 				 * consumer groups queue. */
-				rd_kafka_q_fwd_set(&rktp->rktp_fetchq,
-						   &rkcg->rkcg_q);
-
-				/* Start fetcher for partition */
-				rd_kafka_toppar_fetch_start(rktp,
-							    rktpar->offset,
-							    NULL);
+				rd_kafka_toppar_op_fetch_start(
+					rktp, rktpar->offset,
+					rkcg->rkcg_q, RD_KAFKA_NO_REPLYQ);
 			} else {
 				int64_t offset;
 				/* Fetcher already started,
@@ -781,7 +1075,8 @@ rd_kafka_cgrp_partitions_fetch_start (rd_kafka_cgrp_t *rkcg,
 				else
 					offset = rktpar->offset;
 				rd_kafka_toppar_unlock(rktp);
-				rd_kafka_toppar_seek(rktp, offset, NULL);
+				rd_kafka_toppar_op_seek(rktp, offset,
+							RD_KAFKA_NO_REPLYQ);
 			}
                 }
         }
@@ -793,55 +1088,11 @@ rd_kafka_cgrp_partitions_fetch_start (rd_kafka_cgrp_t *rkcg,
 
 
 
-/**
- * Enqueue a rebalance op (if configured). 'partitions' is copied.
- * This delegates the responsibility of assign() and unassign() to the
- * application.
- *
- * Returns 1 if a rebalance op was enqueued, else 0.
- * Returns 0 if there was no rebalance_cb or 'assignment' is NULL,
- * in which case rd_kafka_cgrp_assign(rkcg,assignment) is called immediately.
- */
-static int
-rd_kafka_rebalance_op (rd_kafka_cgrp_t *rkcg,
-		       rd_kafka_resp_err_t err,
-		       rd_kafka_topic_partition_list_t *assignment,
-		       const char *reason) {
-
-	/* Pause current partition set consumers until new assign() is called. */
-	if (rkcg->rkcg_assignment)
-		rd_kafka_toppars_pause_resume(rkcg->rkcg_rk, 1,
-					      RD_KAFKA_TOPPAR_F_LIB_PAUSE,
-					      rkcg->rkcg_assignment);
-
-	if (!rkcg->rkcg_rk->rk_conf.rebalance_cb || !assignment) {
-		if (err == RD_KAFKA_RESP_ERR__ASSIGN_PARTITIONS)
-			rd_kafka_cgrp_assign(rkcg, assignment);
-		else
-			rd_kafka_cgrp_unassign(rkcg);
-		return 0;
-	}
-
-	rd_kafka_dbg(rkcg->rkcg_rk, CGRP, "ASSIGN",
-		     "Group \"%s\": delegating %s of %d partition(s) "
-		     "to application rebalance callback: %s",
-		     rkcg->rkcg_group_id->str,
-		     err == RD_KAFKA_RESP_ERR__REVOKE_PARTITIONS ?
-		     "revoke":"assign", assignment->cnt, reason);
-
-        rd_kafka_cgrp_set_join_state(
-                rkcg, RD_KAFKA_CGRP_JOIN_STATE_WAIT_REBALANCE_CB);
-
-	rd_kafka_op_app(&rkcg->rkcg_q, RD_KAFKA_OP_REBALANCE,
-			RD_KAFKA_OP_F_FREE, NULL, err,
-			rd_kafka_topic_partition_list_copy(assignment), 0,
-			(void *)rd_kafka_topic_partition_list_destroy);
-	return 1;
-}
 
 
 /**
  * Handler of OffsetCommit response (after parsing).
+ * @remark \p offsets may be NULL if \p err is set
  */
 static void
 rd_kafka_cgrp_handle_OffsetCommit (rd_kafka_cgrp_t *rkcg,
@@ -884,14 +1135,12 @@ rd_kafka_cgrp_handle_OffsetCommit (rd_kafka_cgrp_t *rkcg,
 		}
 	}
 
-	if (offsets)
-		rd_kafka_offset_commit_cb_op(rkcg->rkcg_rk, err, offsets);
-
         if (rd_kafka_cgrp_try_terminate(rkcg))
                 return; /* terminated */
 
         if (rkcg->rkcg_join_state == RD_KAFKA_CGRP_JOIN_STATE_WAIT_UNASSIGN)
-		rd_kafka_cgrp_check_unassign_done(rkcg);
+		rd_kafka_cgrp_check_unassign_done(rkcg,
+                                                  "OffsetCommit done");
 }
 
 
@@ -900,7 +1149,8 @@ rd_kafka_cgrp_handle_OffsetCommit (rd_kafka_cgrp_t *rkcg,
 /**
  * Handle OffsetCommitResponse
  * Takes the original 'rko' as opaque argument.
- * @remark \p rkb is NULL in a number of error cases (e.g., _NO_OFFSET)
+ * @remark \p rkb, rkbuf, and request may be NULL in a number of
+ *         error cases (e.g., _NO_OFFSET, _WAIT_COORD)
  */
 static void rd_kafka_cgrp_op_handle_OffsetCommit (rd_kafka_t *rk,
 						  rd_kafka_broker_t *rkb,
@@ -910,11 +1160,17 @@ static void rd_kafka_cgrp_op_handle_OffsetCommit (rd_kafka_t *rk,
 						  void *opaque) {
 	rd_kafka_cgrp_t *rkcg = rk->rk_cgrp;
         rd_kafka_op_t *rko_orig = opaque;
-        rd_kafka_q_t *replyq;
-	rd_kafka_topic_partition_list_t *offsets = rko_orig->rko_payload;
+	rd_kafka_topic_partition_list_t *offsets =
+		rko_orig->rko_u.offset_commit.partitions; /* maybe NULL */
+
+	RD_KAFKA_OP_TYPE_ASSERT(rko_orig, RD_KAFKA_OP_OFFSET_COMMIT);
 
 	err = rd_kafka_handle_OffsetCommit(rk, rkb, err, rkbuf,
 					   request, offsets);
+        rd_kafka_dbg(rk, CGRP, "COMMIT",
+                     "OffsetCommit for %d partition(s) returned: %s",
+                     offsets ? offsets->cnt : -1,
+                     rd_kafka_err2str(err));
 
 	if (err == RD_KAFKA_RESP_ERR__IN_PROGRESS)
 		return; /* Retrying */
@@ -922,20 +1178,57 @@ static void rd_kafka_cgrp_op_handle_OffsetCommit (rd_kafka_t *rk,
 	rd_kafka_assert(NULL, rkcg->rkcg_wait_commit_cnt > 0);
 	rkcg->rkcg_wait_commit_cnt--;
 
-	if (err == RD_KAFKA_RESP_ERR__DESTROY) {
+	if (err == RD_KAFKA_RESP_ERR__DESTROY ||
+            (err == RD_KAFKA_RESP_ERR__NO_OFFSET &&
+             rko_orig->rko_u.offset_commit.silent_empty)) {
 		rd_kafka_op_destroy(rko_orig);
+                rd_kafka_cgrp_check_unassign_done(
+                        rkcg,
+                        err == RD_KAFKA_RESP_ERR__DESTROY ?
+                        "OffsetCommit done (__DESTROY)" :
+                        "OffsetCommit done (__NO_OFFSET)");
 		return;
 	}
 
-	rd_kafka_cgrp_handle_OffsetCommit(rkcg, err, offsets);
-	if ((replyq = rko_orig->rko_replyq)) {
-                rd_kafka_op_t *rko_reply = rd_kafka_op_new_reply(rko_orig);
-                rd_kafka_op_payload_move(rko_reply, rko_orig);
-                rko_reply->rko_err = err;
-                rd_kafka_q_enq(replyq, rko_reply);
+	/* If no special callback is set but a offset_commit_cb has
+	 * been set in conf then post an event for the latter. */
+	if (!rko_orig->rko_u.offset_commit.cb && rk->rk_conf.offset_commit_cb) {
+                rd_kafka_op_t *rko_reply = rd_kafka_op_new_reply(rko_orig, err);
+
+		if (offsets)
+			rko_reply->rko_u.offset_commit.partitions =
+				rd_kafka_topic_partition_list_copy(offsets);
+
+		rko_reply->rko_u.offset_commit.cb =
+			rk->rk_conf.offset_commit_cb;
+		rko_reply->rko_u.offset_commit.opaque = rk->rk_conf.opaque;
+
+                rd_kafka_q_enq(rk->rk_rep, rko_reply);
+	}
+
+
+	/* Enqueue reply to requester's queue, if any. */
+	if (rko_orig->rko_replyq.q) {
+                rd_kafka_op_t *rko_reply = rd_kafka_op_new_reply(rko_orig, err);
+
+		/* Copy offset & partitions & callbacks to reply op */
+		rko_reply->rko_u.offset_commit = rko_orig->rko_u.offset_commit;
+		if (offsets)
+			rko_reply->rko_u.offset_commit.partitions =
+				rd_kafka_topic_partition_list_copy(offsets);
+
+                rd_kafka_replyq_enq(&rko_orig->rko_replyq, rko_reply, 0);
         }
 
+	rd_kafka_cgrp_handle_OffsetCommit(rkcg, err, offsets);
+
         rd_kafka_op_destroy(rko_orig);
+}
+
+
+static int rd_kafka_topic_partition_has_absolute_offset (
+        const rd_kafka_topic_partition_t *rktpar, void *opaque) {
+        return rktpar->offset >= 0 ? 1 : 0;
 }
 
 
@@ -946,57 +1239,59 @@ static void rd_kafka_cgrp_op_handle_OffsetCommit (rd_kafka_t *rk,
  * a proper topic_partition_list_t with offsets to commit.
  * The offset list will be altered.
  *
- * \p silent_empty: if there are no offsets to commit bail out silently without
- *                  calling the offset_commit_cb.
+ * \p rko...silent_empty: if there are no offsets to commit bail out
+ *                        silently without posting an op on the reply queue.
+ * \p set_offsets: set offsets in rko->rko_u.offset_commit.partitions
  *
  * Locality: cgrp thread
  */
 static void rd_kafka_cgrp_offsets_commit (rd_kafka_cgrp_t *rkcg,
                                           rd_kafka_op_t *rko,
-					  int silent_empty) {
+                                          int set_offsets) {
 	rd_kafka_topic_partition_list_t *offsets;
 	rd_kafka_resp_err_t err;
+        int valid_offsets = 0;
 
 	/* If offsets is NULL we shall use the current assignment. */
-	if (!rko->rko_payload && rkcg->rkcg_assignment) {
-		/* Copy assignment and fill in offsets */
-		rd_kafka_op_payload_set(
-			rko,
+	if (!rko->rko_u.offset_commit.partitions && rkcg->rkcg_assignment)
+		rko->rko_u.offset_commit.partitions =
 			rd_kafka_topic_partition_list_copy(
-				rkcg->rkcg_assignment),
-			(void *)
-			rd_kafka_topic_partition_list_destroy);
+				rkcg->rkcg_assignment);
 
-		rd_kafka_topic_partition_list_set_offsets(
-			rkcg->rkcg_rk,
-			rko->rko_payload, 1,
+	offsets = rko->rko_u.offset_commit.partitions;
+
+        if (offsets) {
+                /* Set offsets to commits */
+                if (set_offsets)
+                        rd_kafka_topic_partition_list_set_offsets(
+			rkcg->rkcg_rk, rko->rko_u.offset_commit.partitions, 1,
 			RD_KAFKA_OFFSET_INVALID/* def */,
 			1 /* is commit */);
 
-	}
+                /*  Check the number of valid offsets to commit. */
+                valid_offsets = rd_kafka_topic_partition_list_sum(
+                        offsets,
+                        rd_kafka_topic_partition_has_absolute_offset, NULL);
+        }
 
-	offsets = rko->rko_payload;
+        if (!(rko->rko_flags & RD_KAFKA_OP_F_REPROCESS)) {
+                /* wait_commit_cnt has already been increased for
+                 * reprocessed ops. */
+                rkcg->rkcg_wait_commit_cnt++;
+        }
 
-	if (!offsets && silent_empty) {
-		rd_kafka_op_destroy(rko);
-		return;
-	}
-
-	/* Reprocessing ops will have increased wait_commit_cnt already. */
-	if (!(rko->rko_flags & RD_KAFKA_OP_F_REPROCESS))
-		rkcg->rkcg_wait_commit_cnt++;
-
-
-	if (!offsets) {
-		err = RD_KAFKA_RESP_ERR__NO_OFFSET;
-		goto err;
+	if (!valid_offsets) {
+                /* No valid offsets */
+                err = RD_KAFKA_RESP_ERR__NO_OFFSET;
+                goto err;
 	}
 
         if (rkcg->rkcg_state != RD_KAFKA_CGRP_STATE_UP || !rkcg->rkcg_rkb ||
 	    rkcg->rkcg_rkb->rkb_source == RD_KAFKA_INTERNAL) {
 		/* wait_coord_q is disabled session.timeout.ms after
 		 * group close() has been initated. */
-		if (rd_kafka_q_ready(&rkcg->rkcg_wait_coord_q)) {
+		if (rko->rko_u.offset_commit.ts_timeout == 0 &&
+                    rd_kafka_q_ready(rkcg->rkcg_wait_coord_q)) {
 			rd_kafka_dbg(rkcg->rkcg_rk, CGRP, "COMMIT",
 				     "Group \"%s\": "
 				     "unable to OffsetCommit in state %s: "
@@ -1008,29 +1303,36 @@ static void rd_kafka_cgrp_offsets_commit (rd_kafka_cgrp_t *rkcg,
 				     rd_kafka_broker_name(rkcg->rkcg_rkb) :
 				     "none");
 			rko->rko_flags |= RD_KAFKA_OP_F_REPROCESS;
-			rd_kafka_q_enq(&rkcg->rkcg_wait_coord_q, rko);
+                        rko->rko_u.offset_commit.ts_timeout = rd_clock() +
+                                (rkcg->rkcg_rk->rk_conf.group_session_timeout_ms
+                                 * 1000);
+			rd_kafka_q_enq(rkcg->rkcg_wait_coord_q, rko);
 			return;
 		}
-
 		err = RD_KAFKA_RESP_ERR__WAIT_COORD;
 
-	} else if (rd_kafka_OffsetCommitRequest(
-			   rkcg->rkcg_rkb, rkcg, 1, offsets,
-			   &rkcg->rkcg_ops,
-			   rd_kafka_cgrp_op_handle_OffsetCommit, rko) != 0)
-		return;
-	else
-		err = RD_KAFKA_RESP_ERR__NO_OFFSET;
+	} else {
+                int r;
+
+                /* Send OffsetCommit */
+                r = rd_kafka_OffsetCommitRequest(
+                            rkcg->rkcg_rkb, rkcg, 1, offsets,
+                            RD_KAFKA_REPLYQ(rkcg->rkcg_ops,
+                                            rkcg->rkcg_version),
+                            rd_kafka_cgrp_op_handle_OffsetCommit, rko);
+
+                /* Must have valid offsets to commit if we get here */
+                rd_kafka_assert(NULL, r != 0);
+
+                return;
+        }
+
+
 
  err:
-	/* No valid offsets */
-	if (silent_empty) {
-		rd_kafka_op_destroy(rko);
-		rkcg->rkcg_wait_commit_cnt--;
-		return;
-	}
-
 	/* Propagate error to whoever wanted offset committed. */
+	rd_kafka_dbg(rkcg->rkcg_rk, CGRP, "COMMIT",
+		     "OffsetCommit internal error: %s", rd_kafka_err2str(err));
 	rd_kafka_cgrp_op_handle_OffsetCommit(rkcg->rkcg_rk, NULL, err,
 					     NULL, NULL, rko);
 }
@@ -1039,12 +1341,25 @@ static void rd_kafka_cgrp_offsets_commit (rd_kafka_cgrp_t *rkcg,
 /**
  * Commit offsets for all assigned partitions.
  */
-static void rd_kafka_cgrp_assigned_offsets_commit (rd_kafka_cgrp_t *rkcg) {
+static void
+rd_kafka_cgrp_assigned_offsets_commit (rd_kafka_cgrp_t *rkcg,
+                                       const rd_kafka_topic_partition_list_t
+                                       *offsets) {
         rd_kafka_op_t *rko;
 
 	rko = rd_kafka_op_new(RD_KAFKA_OP_OFFSET_COMMIT);
-        /* NULL rko_payload means current assignment */
-        rd_kafka_cgrp_offsets_commit(rkcg, rko, 1/*skip-early if no offsets*/);
+	if (rkcg->rkcg_rk->rk_conf.enabled_events & RD_KAFKA_EVENT_OFFSET_COMMIT) {
+		rd_kafka_op_set_replyq(rko, rkcg->rkcg_rk->rk_rep, 0);
+		rko->rko_u.offset_commit.cb =
+			rkcg->rkcg_rk->rk_conf.offset_commit_cb; /*maybe NULL*/
+		rko->rko_u.offset_commit.opaque = rkcg->rkcg_rk->rk_conf.opaque;
+	}
+        /* NULL partitions means current assignment */
+        if (offsets)
+                rko->rko_u.offset_commit.partitions =
+                        rd_kafka_topic_partition_list_copy(offsets);
+	rko->rko_u.offset_commit.silent_empty = 1;
+        rd_kafka_cgrp_offsets_commit(rkcg, rko, 1/* set offsets */);
 }
 
 
@@ -1059,7 +1374,7 @@ static void rd_kafka_cgrp_offset_commit_tmr_cb (rd_kafka_timers_t *rkts,
                                                 void *arg) {
         rd_kafka_cgrp_t *rkcg = arg;
 
-	rd_kafka_cgrp_assigned_offsets_commit(rkcg);
+	rd_kafka_cgrp_assigned_offsets_commit(rkcg, NULL);
 }
 
 
@@ -1068,26 +1383,34 @@ static void rd_kafka_cgrp_offset_commit_tmr_cb (rd_kafka_timers_t *rkts,
 /**
  * Call when all unassign operations are done to transition to the next state
  */
-static void rd_kafka_cgrp_unassign_done (rd_kafka_cgrp_t *rkcg) {
+static void rd_kafka_cgrp_unassign_done (rd_kafka_cgrp_t *rkcg,
+                                         const char *reason) {
 	rd_kafka_dbg(rkcg->rkcg_rk, CGRP, "UNASSIGN",
 		     "Group \"%s\": unassign done in state %s (join state %s): "
-		     "%s",
+		     "%s: %s",
 		     rkcg->rkcg_group_id->str,
 		     rd_kafka_cgrp_state_names[rkcg->rkcg_state],
 		     rd_kafka_cgrp_join_state_names[rkcg->rkcg_join_state],
 		     rkcg->rkcg_assignment ?
-		     "with new assignment" : "without new assignment");
+		     "with new assignment" : "without new assignment",
+                     reason);
 
 	if (rkcg->rkcg_flags & RD_KAFKA_CGRP_F_LEAVE_ON_UNASSIGN) {
 		rd_kafka_cgrp_leave(rkcg, 1/*ignore response*/);
 		rkcg->rkcg_flags &= ~RD_KAFKA_CGRP_F_LEAVE_ON_UNASSIGN;
 	}
 
+        if (rkcg->rkcg_join_state != RD_KAFKA_CGRP_JOIN_STATE_WAIT_UNASSIGN) {
+                rd_kafka_cgrp_try_terminate(rkcg);
+                return;
+        }
+
         if (rkcg->rkcg_assignment) {
 		rd_kafka_cgrp_set_join_state(rkcg,
 					     RD_KAFKA_CGRP_JOIN_STATE_ASSIGNED);
-                rd_kafka_cgrp_partitions_fetch_start(rkcg,
-                                                     rkcg->rkcg_assignment, 0);
+                if (RD_KAFKA_CGRP_CAN_FETCH_START(rkcg))
+                        rd_kafka_cgrp_partitions_fetch_start(
+                                rkcg, rkcg->rkcg_assignment, 0);
 	} else {
 		rd_kafka_cgrp_set_join_state(rkcg,
 					     RD_KAFKA_CGRP_JOIN_STATE_INIT);
@@ -1102,14 +1425,25 @@ static void rd_kafka_cgrp_unassign_done (rd_kafka_cgrp_t *rkcg) {
  * calls .._done().
  * Else does nothing.
  */
-static void rd_kafka_cgrp_check_unassign_done (rd_kafka_cgrp_t *rkcg) {
+static void rd_kafka_cgrp_check_unassign_done (rd_kafka_cgrp_t *rkcg,
+                                               const char *reason) {
 	if (rkcg->rkcg_wait_unassign_cnt > 0 ||
 	    rkcg->rkcg_assigned_cnt > 0 ||
 	    rkcg->rkcg_wait_commit_cnt > 0 ||
-	    rkcg->rkcg_flags & RD_KAFKA_CGRP_F_WAIT_UNASSIGN)
+	    rkcg->rkcg_flags & RD_KAFKA_CGRP_F_WAIT_UNASSIGN) {
+                rd_kafka_dbg(rkcg->rkcg_rk, CGRP, "UNASSIGN",
+                             "Unassign not done yet "
+                             "(%d wait_unassign, %d assigned, %d wait commit"
+                             "%s): %s",
+                             rkcg->rkcg_wait_unassign_cnt,
+                             rkcg->rkcg_assigned_cnt,
+                             rkcg->rkcg_wait_commit_cnt,
+                             (rkcg->rkcg_flags & RD_KAFKA_CGRP_F_WAIT_UNASSIGN)?
+                             ", F_WAIT_UNASSIGN" : "", reason);
 		return;
+        }
 
-	rd_kafka_cgrp_unassign_done(rkcg);
+	rd_kafka_cgrp_unassign_done(rkcg, reason);
 }
 
 
@@ -1120,47 +1454,47 @@ static void rd_kafka_cgrp_check_unassign_done (rd_kafka_cgrp_t *rkcg) {
 static rd_kafka_resp_err_t
 rd_kafka_cgrp_unassign (rd_kafka_cgrp_t *rkcg) {
         int i;
-
-	rkcg->rkcg_flags &= ~RD_KAFKA_CGRP_F_WAIT_UNASSIGN;
-
-        if (!rkcg->rkcg_assignment) {
-		rd_kafka_cgrp_check_unassign_done(rkcg);
-                return RD_KAFKA_RESP_ERR_NO_ERROR;
-	}
-
-        rd_kafka_dbg(rkcg->rkcg_rk, CGRP, "UNASSIGN",
-                     "Group \"%s\": unassigning %d partition(s)",
-                     rkcg->rkcg_group_id->str, rkcg->rkcg_assignment->cnt);
+        rd_kafka_topic_partition_list_t *old_assignment;
 
         rd_kafka_cgrp_set_join_state(rkcg,
                                      RD_KAFKA_CGRP_JOIN_STATE_WAIT_UNASSIGN);
+
+	rkcg->rkcg_flags &= ~RD_KAFKA_CGRP_F_WAIT_UNASSIGN;
+        old_assignment = rkcg->rkcg_assignment;
+        if (!old_assignment) {
+		rd_kafka_cgrp_check_unassign_done(
+                        rkcg, "unassign (no previous assignment)");
+                return RD_KAFKA_RESP_ERR_NO_ERROR;
+	}
+        rkcg->rkcg_assignment = NULL;
+
+	rd_kafka_cgrp_version_new_barrier(rkcg);
+
+	rd_kafka_dbg(rkcg->rkcg_rk, CGRP, "UNASSIGN",
+                     "Group \"%s\": unassigning %d partition(s) (v%"PRId32")",
+                     rkcg->rkcg_group_id->str, old_assignment->cnt,
+		     rkcg->rkcg_version);
 
         if (rkcg->rkcg_rk->rk_conf.offset_store_method ==
             RD_KAFKA_OFFSET_METHOD_BROKER &&
 	    rkcg->rkcg_rk->rk_conf.enable_auto_commit) {
                 /* Commit all offsets for all assigned partitions to broker */
-                rd_kafka_cgrp_assigned_offsets_commit(rkcg);
+                rd_kafka_cgrp_assigned_offsets_commit(rkcg, old_assignment);
         }
 
-
-        for (i = 0 ; i < rkcg->rkcg_assignment->cnt ; i++) {
+        for (i = 0 ; i < old_assignment->cnt ; i++) {
                 rd_kafka_topic_partition_t *rktpar;
                 shptr_rd_kafka_toppar_t *s_rktp;
                 rd_kafka_toppar_t *rktp;
 
-                rktpar = &rkcg->rkcg_assignment->elems[i];
+                rktpar = &old_assignment->elems[i];
                 s_rktp = rktpar->_private;
                 rktp = rd_kafka_toppar_s2i(s_rktp);
 
                 if (rktp->rktp_assigned) {
-			rd_kafka_op_t *rko;
-			/* Place-holder for providing replyq to fetch_stop() */
-			rko = rd_kafka_op_new(RD_KAFKA_OP_FETCH_STOP);
-			rko->rko_replyq = &rkcg->rkcg_ops;
-			rd_kafka_q_keep(rko->rko_replyq);
-                        rd_kafka_toppar_fetch_stop(rktp, rko);
+                        rd_kafka_toppar_op_fetch_stop(
+				rktp, RD_KAFKA_REPLYQ(rkcg->rkcg_ops, 0));
                         rkcg->rkcg_wait_unassign_cnt++;
-			rd_kafka_op_destroy(rko);
                 }
 
                 rd_kafka_toppar_lock(rktp);
@@ -1171,13 +1505,11 @@ rd_kafka_cgrp_unassign (rd_kafka_cgrp_t *rkcg) {
 	/* Resume partition consumption. */
 	rd_kafka_toppars_pause_resume(rkcg->rkcg_rk, 0/*resume*/,
 				      RD_KAFKA_TOPPAR_F_LIB_PAUSE,
-				      rkcg->rkcg_assignment);
+                                      old_assignment);
 
-        rd_kafka_topic_partition_list_destroy(rkcg->rkcg_assignment);
-        rkcg->rkcg_assignment = NULL;
+        rd_kafka_topic_partition_list_destroy(old_assignment);
 
-	if (rkcg->rkcg_wait_unassign_cnt == 0)
-		rd_kafka_cgrp_check_unassign_done(rkcg);
+        rd_kafka_cgrp_check_unassign_done(rkcg, "unassign");
 
         return RD_KAFKA_RESP_ERR_NO_ERROR;
 }
@@ -1192,9 +1524,15 @@ rd_kafka_cgrp_assign (rd_kafka_cgrp_t *rkcg,
                       rd_kafka_topic_partition_list_t *assignment) {
         int i;
 
-        /* FIXME: Make a diff of what partitions are removed and added. */
+        rd_kafka_dbg(rkcg->rkcg_rk, CGRP, "ASSIGN",
+                     "Group \"%s\": new assignment of %d partition(s) "
+                     "in join state %s",
+                     rkcg->rkcg_group_id->str,
+                     assignment ? assignment->cnt : 0,
+                     rd_kafka_cgrp_join_state_names[rkcg->rkcg_join_state]);
 
-        /* Get toppar object for each partition */
+        /* Get toppar object for each partition.
+         * This is to make sure the rktp stays alive during unassign(). */
         for (i = 0 ; assignment && i < assignment->cnt ; i++) {
                 rd_kafka_topic_partition_t *rktpar;
                 shptr_rd_kafka_toppar_t *s_rktp;
@@ -1213,6 +1551,12 @@ rd_kafka_cgrp_assign (rd_kafka_cgrp_t *rkcg,
                         rktpar->_private = s_rktp;
         }
 
+        rd_kafka_cgrp_version_new_barrier(rkcg);
+
+        rd_kafka_wrlock(rkcg->rkcg_rk);
+        rkcg->rkcg_c.assignment_size = assignment ? assignment->cnt : 0;
+        rd_kafka_wrunlock(rkcg->rkcg_rk);
+
 
         /* Remove existing assignment (async operation) */
 	if (rkcg->rkcg_assignment)
@@ -1225,13 +1569,28 @@ rd_kafka_cgrp_assign (rd_kafka_cgrp_t *rkcg,
 
 
 	if (assignment) {
-		if (rkcg->rkcg_wait_unassign_cnt == 0)
-			rd_kafka_cgrp_set_join_state(
-				rkcg, RD_KAFKA_CGRP_JOIN_STATE_ASSIGNED);
 		rkcg->rkcg_assignment =
 			rd_kafka_topic_partition_list_copy(assignment);
-	} else
-		rkcg->rkcg_assignment = NULL;
+
+                /* Mark partition(s) as desired */
+                for (i = 0 ; i < rkcg->rkcg_assignment->cnt ; i++) {
+                        rd_kafka_topic_partition_t *rktpar =
+                                &rkcg->rkcg_assignment->elems[i];
+                        shptr_rd_kafka_toppar_t *s_rktp = rktpar->_private;
+                        rd_kafka_toppar_t *rktp =
+                                rd_kafka_toppar_s2i(s_rktp);
+                        rd_kafka_toppar_lock(rktp);
+                        rd_kafka_toppar_desired_add0(rktp);
+                        rd_kafka_toppar_unlock(rktp);
+                }
+        }
+
+        if (rkcg->rkcg_join_state == RD_KAFKA_CGRP_JOIN_STATE_WAIT_UNASSIGN)
+                return;
+
+        rd_dassert(rkcg->rkcg_wait_unassign_cnt == 0);
+
+        rd_kafka_cgrp_set_join_state(rkcg, RD_KAFKA_CGRP_JOIN_STATE_ASSIGNED);
 
         if (RD_KAFKA_CGRP_CAN_FETCH_START(rkcg) && rkcg->rkcg_assignment) {
                 /* No existing assignment that needs to be decommissioned,
@@ -1285,6 +1644,13 @@ void rd_kafka_cgrp_handle_heartbeat_error (rd_kafka_cgrp_t *rkcg,
 		     rkcg->rkcg_assignment ? rkcg->rkcg_assignment->cnt : 0,
 		     rd_kafka_err2str(err));
 
+	if (rkcg->rkcg_join_state <= RD_KAFKA_CGRP_JOIN_STATE_WAIT_SYNC) {
+		rd_kafka_dbg(rkcg->rkcg_rk, CGRP, "HEARTBEAT",
+			     "Heartbeat response: discarding outdated "
+			     "request (now in join-state %s)",
+			     rd_kafka_cgrp_join_state_names[rkcg->rkcg_join_state]);
+		return;
+	}
 
 	switch (err)
 	{
@@ -1298,10 +1664,18 @@ void rd_kafka_cgrp_handle_heartbeat_error (rd_kafka_cgrp_t *rkcg,
 		rd_interval_expedite(&rkcg->rkcg_coord_query_intvl, 0);
 		break;
 
+	case RD_KAFKA_RESP_ERR_UNKNOWN_MEMBER_ID:
+		rd_kafka_cgrp_set_member_id(rkcg, "");
 	case RD_KAFKA_RESP_ERR_REBALANCE_IN_PROGRESS:
 	case RD_KAFKA_RESP_ERR_ILLEGAL_GENERATION:
-	case RD_KAFKA_RESP_ERR_UNKNOWN_MEMBER_ID:
 	default:
+                /* Just revert to INIT state if join state is active. */
+                if (rkcg->rkcg_join_state <
+                    RD_KAFKA_CGRP_JOIN_STATE_WAIT_ASSIGN_REBALANCE_CB ||
+                    rkcg->rkcg_join_state ==
+                    RD_KAFKA_CGRP_JOIN_STATE_WAIT_REVOKE_REBALANCE_CB)
+                        break;
+
                 rd_kafka_cgrp_set_join_state(rkcg, RD_KAFKA_CGRP_JOIN_STATE_INIT);
 
                 if (!(rkcg->rkcg_flags & RD_KAFKA_CGRP_F_WAIT_UNASSIGN)) {
@@ -1341,6 +1715,9 @@ void rd_kafka_cgrp_group_leader_reset (rd_kafka_cgrp_t *rkcg){
         }
 }
 
+
+
+
 /**
  * Remove existing topic subscription.
  */
@@ -1349,17 +1726,20 @@ rd_kafka_cgrp_unsubscribe (rd_kafka_cgrp_t *rkcg, int leave_group) {
 
 	rd_kafka_dbg(rkcg->rkcg_rk, CGRP, "UNSUBSCRIBE",
 		     "Group \"%.*s\": unsubscribe from current %ssubscription "
-		     "of %d topics (leave group=%s, join state %s)",
+		     "of %d topics (leave group=%s, join state %s, v%"PRId32")",
 		     RD_KAFKAP_STR_PR(rkcg->rkcg_group_id),
 		     rkcg->rkcg_subscription ? "" : "unset ",
 		     rkcg->rkcg_subscription ? rkcg->rkcg_subscription->cnt : 0,
 		     leave_group ? "yes":"no",
-		     rd_kafka_cgrp_join_state_names[rkcg->rkcg_join_state]);
+		     rd_kafka_cgrp_join_state_names[rkcg->rkcg_join_state],
+		     rkcg->rkcg_version);
 
         if (rkcg->rkcg_subscription) {
                 rd_kafka_topic_partition_list_destroy(rkcg->rkcg_subscription);
                 rkcg->rkcg_subscription = NULL;
         }
+
+	rd_kafka_cgrp_update_subscribed_topics(rkcg, NULL);
 
         /*
          * Clean-up group leader duties, if any.
@@ -1394,7 +1774,7 @@ static rd_kafka_resp_err_t
 rd_kafka_cgrp_subscribe (rd_kafka_cgrp_t *rkcg,
                          rd_kafka_topic_partition_list_t *rktparlist) {
 
-	rd_kafka_dbg(rkcg->rkcg_rk, CGRP, "UNSUBSCRIBE",
+	rd_kafka_dbg(rkcg->rkcg_rk, CGRP, "SUBSCRIBE",
 		     "Group \"%.*s\": subscribe to new %ssubscription "
 		     "of %d topics (join state %s)",
 		     RD_KAFKAP_STR_PR(rkcg->rkcg_group_id),
@@ -1445,18 +1825,23 @@ rd_kafka_cgrp_terminate0 (rd_kafka_cgrp_t *rkcg, rd_kafka_op_t *rko) {
                      rd_kafka_cgrp_state_names[rkcg->rkcg_state],
                      rd_list_cnt(&rkcg->rkcg_toppars));
 
-        if (unlikely(rkcg->rkcg_reply_rko != NULL)) {
-                /* Already handling a previous terminate */
-                rd_kafka_q_t *replyq = rko->rko_replyq;
-                rko->rko_replyq = NULL;
-                rd_kafka_q_op_err(replyq, RD_KAFKA_OP_CONSUMER_ERR,
-                                  RD_KAFKA_RESP_ERR__IN_PROGRESS,
-                                  rkcg->rkcg_reply_rko->rko_version,
-                                  "Group is busy handling %s",
-                                  rd_kafka_op2str(rkcg->rkcg_reply_rko->
-                                                  rko_type));
-                rd_kafka_q_destroy(replyq);
-                rd_kafka_op_destroy(rko);
+        if (unlikely(rkcg->rkcg_state == RD_KAFKA_CGRP_STATE_TERM ||
+		     (rkcg->rkcg_flags & RD_KAFKA_CGRP_F_TERMINATE) ||
+		     rkcg->rkcg_reply_rko != NULL)) {
+                /* Already terminating or handling a previous terminate */
+		if (rko) {
+			rd_kafka_q_t *rkq = rko->rko_replyq.q;
+			rko->rko_replyq.q = NULL;
+			rd_kafka_q_op_err(rkq, RD_KAFKA_OP_CONSUMER_ERR,
+					  RD_KAFKA_RESP_ERR__IN_PROGRESS,
+					  rko->rko_replyq.version,
+					  NULL, 0,
+					  "Group is %s",
+					  rkcg->rkcg_reply_rko ?
+					  "terminating":"terminated");
+			rd_kafka_q_destroy(rkq);
+			rd_kafka_op_destroy(rko);
+		}
                 return;
         }
 
@@ -1465,6 +1850,16 @@ rd_kafka_cgrp_terminate0 (rd_kafka_cgrp_t *rkcg, rd_kafka_op_t *rko) {
         rkcg->rkcg_flags |= RD_KAFKA_CGRP_F_TERMINATE;
 	rkcg->rkcg_ts_terminate = rd_clock();
         rkcg->rkcg_reply_rko = rko;
+
+	/* If there's an oustanding rebalance_cb which has not yet been
+	 * served by the application it wont be served from now by any poll()
+	 * call since the application is calling close().
+	 * So we could either wait for close() to serve the queue or simply
+	 * perform an unassign call here directly to speed things up.
+	 * We choose the latter since the app has already decided to shut down
+	 * there is no point in lingering about. */
+	if (RD_KAFKA_CGRP_WAIT_REBALANCE_CB(rkcg))
+		rd_kafka_cgrp_assign(rkcg, NULL);
 
         if (rkcg->rkcg_flags & RD_KAFKA_CGRP_F_SUBSCRIPTION)
                 rd_kafka_cgrp_unsubscribe(rkcg, 1/*leave group*/);
@@ -1481,12 +1876,74 @@ rd_kafka_cgrp_terminate0 (rd_kafka_cgrp_t *rkcg, rd_kafka_op_t *rko) {
  *
  * Locality: any thread
  */
-void rd_kafka_cgrp_terminate (rd_kafka_cgrp_t *rkcg, rd_kafka_q_t *replyq) {
+void rd_kafka_cgrp_terminate (rd_kafka_cgrp_t *rkcg, rd_kafka_replyq_t replyq) {
 	rd_kafka_assert(NULL, !thrd_is_current(rkcg->rkcg_rk->rk_thread));
         rd_kafka_cgrp_op(rkcg, NULL, replyq, RD_KAFKA_OP_TERMINATE, 0);
 }
 
 
+struct _op_timeout_offset_commit {
+        rd_ts_t now;
+        rd_kafka_t *rk;
+        rd_list_t expired;
+};
+
+/**
+ * q_filter callback for expiring OFFSET_COMMIT timeouts.
+ */
+static int rd_kafka_op_offset_commit_timeout_check (rd_kafka_q_t *rkq,
+                                                    rd_kafka_op_t *rko,
+                                                    void *opaque) {
+        struct _op_timeout_offset_commit *state =
+                (struct _op_timeout_offset_commit*)opaque;
+
+        if (likely(rko->rko_type != RD_KAFKA_OP_OFFSET_COMMIT ||
+                   rko->rko_u.offset_commit.ts_timeout == 0 ||
+                   rko->rko_u.offset_commit.ts_timeout > state->now)) {
+                return 0;
+        }
+
+        rd_kafka_q_deq0(rkq, rko);
+
+        /* Add to temporary list to avoid recursive
+         * locking of rkcg_wait_coord_q. */
+        rd_list_add(&state->expired, rko);
+        return 1;
+}
+
+
+/**
+ * Scan for various timeouts.
+ */
+static void rd_kafka_cgrp_timeout_scan (rd_kafka_cgrp_t *rkcg, rd_ts_t now) {
+        struct _op_timeout_offset_commit ofc_state;
+        int i, cnt = 0;
+        rd_kafka_op_t *rko;
+
+        ofc_state.now = now;
+        ofc_state.rk = rkcg->rkcg_rk;
+        rd_list_init(&ofc_state.expired, 0);
+
+        cnt += rd_kafka_q_apply(rkcg->rkcg_wait_coord_q,
+                                rd_kafka_op_offset_commit_timeout_check,
+                                &ofc_state);
+
+        RD_LIST_FOREACH(rko, &ofc_state.expired, i)
+                rd_kafka_cgrp_op_handle_OffsetCommit(
+                        rkcg->rkcg_rk, NULL,
+                        RD_KAFKA_RESP_ERR__WAIT_COORD,
+                        NULL, NULL, rko);
+
+        rd_list_destroy(&ofc_state.expired, NULL);
+
+        if (cnt > 0)
+                rd_kafka_dbg(rkcg->rkcg_rk, CGRP, "CGRPTIMEOUT",
+                             "Group \"%.*s\": timed out %d op(s), %d remain",
+                             RD_KAFKAP_STR_PR(rkcg->rkcg_group_id), cnt,
+                             rd_kafka_q_len(rkcg->rkcg_wait_coord_q));
+
+
+}
 
 
 /**
@@ -1496,7 +1953,8 @@ static void rd_kafka_cgrp_op_serve (rd_kafka_cgrp_t *rkcg,
                                     rd_kafka_broker_t *rkb) {
         rd_kafka_op_t *rko;
 
-        while ((rko = rd_kafka_q_pop(&rkcg->rkcg_ops, RD_POLL_NOWAIT, 0))) {
+        while ((rko = rd_kafka_q_pop(rkcg->rkcg_ops, RD_POLL_NOWAIT,
+				     rkcg->rkcg_version))) {
                 rd_kafka_toppar_t *rktp = rko->rko_rktp ?
                         rd_kafka_toppar_s2i(rko->rko_rktp) : NULL;
                 rd_kafka_resp_err_t err;
@@ -1505,35 +1963,35 @@ static void rd_kafka_cgrp_op_serve (rd_kafka_cgrp_t *rkcg,
                 if (rktp && !silent_op)
                         rd_kafka_dbg(rkcg->rkcg_rk, CGRP, "CGRPOP",
                                      "Group \"%.*s\" received op %s in state %s "
-                                     "(join state %s) for %.*s [%"PRId32"]",
+                                     "(join state %s, v%"PRId32") "
+				     "for %.*s [%"PRId32"]",
                                      RD_KAFKAP_STR_PR(rkcg->rkcg_group_id),
                                      rd_kafka_op2str(rko->rko_type),
                                      rd_kafka_cgrp_state_names[rkcg->rkcg_state],
                                      rd_kafka_cgrp_join_state_names[rkcg->rkcg_join_state],
+				     rkcg->rkcg_version,
                                      RD_KAFKAP_STR_PR(rktp->rktp_rkt->rkt_topic),
                                      rktp->rktp_partition);
                 else if (!silent_op)
                         rd_kafka_dbg(rkcg->rkcg_rk, CGRP, "CGRPOP",
-                                     "Group \"%.*s\" received op %s in state %s "
-                                     "(join state %s)",
+                                     "Group \"%.*s\" received op %s (v%d) in state %s "
+                                     "(join state %s, v%"PRId32" vs %"PRId32")",
                                      RD_KAFKAP_STR_PR(rkcg->rkcg_group_id),
                                      rd_kafka_op2str(rko->rko_type),
+				     rko->rko_version,
                                      rd_kafka_cgrp_state_names[rkcg->rkcg_state],
-                                     rd_kafka_cgrp_join_state_names[rkcg->rkcg_join_state]);
+                                     rd_kafka_cgrp_join_state_names[rkcg->rkcg_join_state],
+				     rkcg->rkcg_version, rko->rko_version);
 
                 switch ((int)rko->rko_type)
                 {
-                case RD_KAFKA_OP_CALLBACK:
-                        rd_kafka_op_call(rkcg->rkcg_rk, rko);
-                        break;
-
 		case RD_KAFKA_OP_NAME:
 			/* Return the currently assigned member id. */
-			rd_kafka_op_reply(rko, 0,
-					  rkcg->rkcg_member_id ?
-					  RD_KAFKAP_STR_DUP(rkcg->
-							    rkcg_member_id) :
-					  NULL, 0, rd_free);
+			if (rkcg->rkcg_member_id)
+				rko->rko_u.name.str =
+					RD_KAFKAP_STR_DUP(rkcg->rkcg_member_id);
+			rd_kafka_op_reply(rko, 0);
+			rko = NULL;
 			break;
 
                 case RD_KAFKA_OP_OFFSET_FETCH:
@@ -1549,9 +2007,9 @@ static void rd_kafka_cgrp_op_serve (rd_kafka_cgrp_t *rkcg,
 
                         rd_kafka_OffsetFetchRequest(
                                 rkb, 1,
-                                (rd_kafka_topic_partition_list_t *)
-                                rko->rko_payload,
-                                &rkcg->rkcg_ops,
+				rko->rko_u.offset_fetch.partitions,
+                                RD_KAFKA_REPLYQ(rkcg->rkcg_ops,
+						rkcg->rkcg_version),
                                 rd_kafka_op_handle_OffsetFetch, rko);
                         rko = NULL; /* rko now owned by request */
                         break;
@@ -1561,14 +2019,15 @@ static void rd_kafka_cgrp_op_serve (rd_kafka_cgrp_t *rkcg,
 
                         /* If terminating tell the partition to leave */
                         if (rkcg->rkcg_flags & RD_KAFKA_CGRP_F_TERMINATE)
-				rd_kafka_toppar_fetch_stop(rktp, NULL);
+				rd_kafka_toppar_op_fetch_stop(
+					rktp, RD_KAFKA_NO_REPLYQ);
                         break;
 
                 case RD_KAFKA_OP_PARTITION_LEAVE:
                         rd_kafka_cgrp_partition_del(rkcg, rktp);
                         break;
 
-                case RD_KAFKA_OP_FETCH_STOP:
+                case RD_KAFKA_OP_FETCH_STOP|RD_KAFKA_OP_REPLY:
                         /* Reply from toppar FETCH_STOP */
                         rd_kafka_assert(rkcg->rkcg_rk,
                                         rkcg->rkcg_wait_unassign_cnt > 0);
@@ -1580,19 +2039,22 @@ static void rd_kafka_cgrp_op_serve (rd_kafka_cgrp_t *rkcg,
                         rktp->rktp_assigned = 0;
 			rkcg->rkcg_assigned_cnt--;
 
-                        if (rkcg->rkcg_wait_unassign_cnt > 0)
-                                break;
-
                         /* All unassigned toppars now stopped and commit done:
                          * transition to the next state. */
                         if (rkcg->rkcg_join_state ==
                             RD_KAFKA_CGRP_JOIN_STATE_WAIT_UNASSIGN)
-                                rd_kafka_cgrp_check_unassign_done(rkcg);
+                                rd_kafka_cgrp_check_unassign_done(rkcg,
+                                        "FETCH_STOP done");
                         break;
 
                 case RD_KAFKA_OP_OFFSET_COMMIT:
                         /* Trigger offsets commit. */
-                        rd_kafka_cgrp_offsets_commit(rkcg, rko, 0);
+                        rd_kafka_cgrp_offsets_commit(rkcg, rko,
+                                                     /* only set offsets
+                                                      * if no partitions were
+                                                      * specified. */
+                                                     rko->rko_u.offset_commit.
+                                                     partitions ? 0 : 1);
                         rko = NULL; /* rko now owned by request */
                         break;
 
@@ -1607,65 +2069,56 @@ static void rd_kafka_cgrp_op_serve (rd_kafka_cgrp_t *rkcg,
                 case RD_KAFKA_OP_SUBSCRIBE:
                         /* New atomic subscription (may be NULL) */
                         err = rd_kafka_cgrp_subscribe(
-                                rkcg,
-                                (rd_kafka_topic_partition_list_t *)
-                                rko->rko_payload);
+                                rkcg, rko->rko_u.subscribe.topics);
                         if (!err)
-                                rko->rko_payload = NULL; /* list owned by rkcg */
-                        rd_kafka_op_reply(rko, err, NULL, 0, NULL);
+                                rko->rko_u.subscribe.topics = NULL; /* list owned by rkcg */
+                        rd_kafka_op_reply(rko, err);
+			rko = NULL;
                         break;
 
                 case RD_KAFKA_OP_ASSIGN:
                         /* New atomic assignment (payload != NULL),
 			 * or unassignment (payload == NULL) */
-			if (rko->rko_payload &&
+			if (rko->rko_u.assign.partitions &&
 			    rkcg->rkcg_flags & RD_KAFKA_CGRP_F_TERMINATE) {
 				/* Dont allow new assignments when terminating */
 				err = RD_KAFKA_RESP_ERR__DESTROY;
 			} else {
 				rd_kafka_cgrp_assign(
-					rkcg,
-					(rd_kafka_topic_partition_list_t *)
-					rko->rko_payload);
+					rkcg, rko->rko_u.assign.partitions);
 				err = 0;
 			}
-                        rd_kafka_op_reply(rko, err, NULL, 0, NULL);
+                        rd_kafka_op_reply(rko, err);
+			rko = NULL;
                         break;
 
                 case RD_KAFKA_OP_GET_SUBSCRIPTION:
-                {
-                        rd_kafka_topic_partition_list_t *rktparlist = NULL;
-
                         if (rkcg->rkcg_subscription)
-                                rktparlist = rd_kafka_topic_partition_list_copy(rkcg->rkcg_subscription);
-                        rd_kafka_op_reply(rko, 0, rktparlist, 0,
-                                          (void *)rd_kafka_topic_partition_list_destroy);
-                }
-                break;
+				rko->rko_u.subscribe.topics =
+					rd_kafka_topic_partition_list_copy(
+						rkcg->rkcg_subscription);
+                        rd_kafka_op_reply(rko, 0);
+			rko = NULL;
+			break;
 
                 case RD_KAFKA_OP_GET_ASSIGNMENT:
-                {
-                        rd_kafka_topic_partition_list_t *rktparlist = NULL;
-
                         if (rkcg->rkcg_assignment)
-                                rktparlist = rd_kafka_topic_partition_list_copy(rkcg->rkcg_assignment);
-                        rd_kafka_op_reply(rko, 0, rktparlist, 0,
-                                          (void *)rd_kafka_topic_partition_list_destroy);
-                }
-                break;
+				rko->rko_u.assign.partitions =
+					rd_kafka_topic_partition_list_copy(
+						rkcg->rkcg_assignment);
+
+                        rd_kafka_op_reply(rko, 0);
+			rko = NULL;
+			break;
 
                 case RD_KAFKA_OP_TERMINATE:
                         rd_kafka_cgrp_terminate0(rkcg, rko);
                         rko = NULL; /* terminate0() takes ownership */
                         break;
 
-                case RD_KAFKA_OP_RECV_BUF:
-                        /* Handle response */
-                        rd_kafka_buf_handle_op(rko, rko->rko_err);
-                        break;
-
                 default:
-                        rd_kafka_assert(rkcg->rkcg_rk, !*"unknown type");
+			if (!rd_kafka_op_handle_std(rkcg->rkcg_rk, rko))
+				rd_kafka_assert(rkcg->rkcg_rk, !*"unknown type");
                         break;
                 }
 
@@ -1695,24 +2148,21 @@ static void rd_kafka_cgrp_join_state_serve (rd_kafka_cgrp_t *rkcg,
                 if (!rkcg->rkcg_subscription)
                         break;
 
-                if (rd_interval(&rkcg->rkcg_join_intvl, 1000*1000, 0) > 0)
+                if (rd_interval_immediate(&rkcg->rkcg_join_intvl,
+					  1000*1000, 0) > 0)
                         rd_kafka_cgrp_join(rkcg);
                 break;
 
         case RD_KAFKA_CGRP_JOIN_STATE_WAIT_JOIN:
-                break;
-
         case RD_KAFKA_CGRP_JOIN_STATE_WAIT_METADATA:
-                break;
-
         case RD_KAFKA_CGRP_JOIN_STATE_WAIT_SYNC:
-                break;
-
         case RD_KAFKA_CGRP_JOIN_STATE_WAIT_UNASSIGN:
+	case RD_KAFKA_CGRP_JOIN_STATE_WAIT_REVOKE_REBALANCE_CB:
 		break;
 
-        case RD_KAFKA_CGRP_JOIN_STATE_WAIT_REBALANCE_CB:
+        case RD_KAFKA_CGRP_JOIN_STATE_WAIT_ASSIGN_REBALANCE_CB:
         case RD_KAFKA_CGRP_JOIN_STATE_ASSIGNED:
+	case RD_KAFKA_CGRP_JOIN_STATE_STARTED:
                 if (rkcg->rkcg_flags & RD_KAFKA_CGRP_F_SUBSCRIPTION &&
                     rd_interval(&rkcg->rkcg_heartbeat_intvl,
                                 rkcg->rkcg_rk->rk_conf.
@@ -1729,6 +2179,7 @@ static void rd_kafka_cgrp_join_state_serve (rd_kafka_cgrp_t *rkcg,
 void rd_kafka_cgrp_serve (rd_kafka_cgrp_t *rkcg) {
 	rd_kafka_broker_t *rkb = rkcg->rkcg_rkb;
 	int rkb_state = RD_KAFKA_BROKER_STATE_INIT;
+        rd_ts_t now;
 
 	if (rkb) {
 		rd_kafka_broker_lock(rkb);
@@ -1745,9 +2196,13 @@ void rd_kafka_cgrp_serve (rd_kafka_cgrp_t *rkcg) {
 
         rd_kafka_cgrp_op_serve(rkcg, rkb);
 
+        now = rd_clock();
+
 	/* Check for cgrp termination */
-	if (unlikely(rd_kafka_cgrp_try_terminate(rkcg)))
-		return; /* cgrp terminated */
+	if (unlikely(rd_kafka_cgrp_try_terminate(rkcg))) {
+                rd_kafka_cgrp_terminated(rkcg);
+                return; /* cgrp terminated */
+        }
 
         /* Bail out if we're terminating. */
         if (unlikely(rd_kafka_terminating(rkcg->rkcg_rk)))
@@ -1764,7 +2219,8 @@ void rd_kafka_cgrp_serve (rd_kafka_cgrp_t *rkcg) {
 
         case RD_KAFKA_CGRP_STATE_QUERY_COORD:
                 /* Query for coordinator. */
-                if (rd_interval(&rkcg->rkcg_coord_query_intvl, 500*1000, 0) > 0)
+                if (rd_interval_immediate(&rkcg->rkcg_coord_query_intvl,
+					  500*1000, now) > 0)
                         rd_kafka_cgrp_coord_query(rkcg,
                                                   "intervaled in "
                                                   "state query-coord");
@@ -1781,7 +2237,7 @@ void rd_kafka_cgrp_serve (rd_kafka_cgrp_t *rkcg) {
 
                 /* Coordinator query */
                 if (rd_interval(&rkcg->rkcg_coord_query_intvl,
-                                1000*1000, 0) > 0)
+				1000*1000, now) > 0)
                         rd_kafka_cgrp_coord_query(rkcg,
                                                   "intervaled in "
                                                   "state wait-broker");
@@ -1795,7 +2251,7 @@ void rd_kafka_cgrp_serve (rd_kafka_cgrp_t *rkcg) {
 			    rkb, RD_KAFKA_FEATURE_BROKER_GROUP_COORD)) {
 			/* Coordinator query */
 			if (rd_interval(&rkcg->rkcg_coord_query_intvl,
-					1000*1000, 0) > 0)
+					1000*1000, now) > 0)
 				rd_kafka_cgrp_coord_query(
 					rkcg,
 					"intervaled in state "
@@ -1815,12 +2271,12 @@ void rd_kafka_cgrp_serve (rd_kafka_cgrp_t *rkcg) {
         case RD_KAFKA_CGRP_STATE_UP:
 		/* Move any ops awaiting the coordinator to the ops queue
 		 * for reprocessing. */
-		rd_kafka_q_concat(&rkcg->rkcg_ops, &rkcg->rkcg_wait_coord_q);
+		rd_kafka_q_concat(rkcg->rkcg_ops, rkcg->rkcg_wait_coord_q);
 
                 /* Relaxed coordinator queries. */
                 if (rd_interval(&rkcg->rkcg_coord_query_intvl,
                                 rkcg->rkcg_rk->rk_conf.
-                                coord_query_intvl_ms * 1000, 0) > 0)
+                                coord_query_intvl_ms * 1000, now) > 0)
                         rd_kafka_cgrp_coord_query(rkcg,
                                                   "intervaled in state up");
 
@@ -1831,6 +2287,11 @@ void rd_kafka_cgrp_serve (rd_kafka_cgrp_t *rkcg) {
                 break;
 
         }
+
+        if (unlikely(rkcg->rkcg_state != RD_KAFKA_CGRP_STATE_UP &&
+                     rd_interval(&rkcg->rkcg_timeout_scan_intvl,
+                                 1000*1000, now) > 0))
+                rd_kafka_cgrp_timeout_scan(rkcg, now);
 }
 
 
@@ -1843,20 +2304,18 @@ void rd_kafka_cgrp_serve (rd_kafka_cgrp_t *rkcg) {
  * Locality: any thread
  */
 void rd_kafka_cgrp_op (rd_kafka_cgrp_t *rkcg, rd_kafka_toppar_t *rktp,
-                       rd_kafka_q_t *replyq, rd_kafka_op_type_t type,
+                       rd_kafka_replyq_t replyq, rd_kafka_op_type_t type,
                        rd_kafka_resp_err_t err) {
         rd_kafka_op_t *rko;
 
         rko = rd_kafka_op_new(type);
         rko->rko_err = err;
-        if (replyq) {
-                rko->rko_replyq = replyq;
-                rd_kafka_q_keep(replyq);
-        }
-        if (rktp)
+	rko->rko_replyq = replyq;
+
+	if (rktp)
                 rko->rko_rktp = rd_kafka_toppar_keep(rktp);
 
-        rd_kafka_q_enq(&rkcg->rkcg_ops, rko);
+        rd_kafka_q_enq(rkcg->rkcg_ops, rko);
 }
 
 
@@ -1922,12 +2381,14 @@ rd_kafka_cgrp_assignor_run (rd_kafka_cgrp_t *rkcg,
                      "Group \"%s\": \"%s\" assignor run for %d member(s)",
                      rkcg->rkcg_group_id->str, protocol_name, member_cnt);
 
+	rd_kafka_cgrp_set_join_state(rkcg, RD_KAFKA_CGRP_JOIN_STATE_WAIT_SYNC);
+
         /* Respond to broker with assignment set or error */
         rd_kafka_SyncGroupRequest(rkcg->rkcg_rkb,
                                   rkcg->rkcg_group_id, rkcg->rkcg_generation_id,
                                   rkcg->rkcg_member_id,
                                   members, err ? 0 : member_cnt,
-                                  &rkcg->rkcg_ops,
+                                  RD_KAFKA_REPLYQ(rkcg->rkcg_ops, 0),
                                   rd_kafka_handle_SyncGroup, rkcg);
         return;
 
@@ -1957,8 +2418,42 @@ void rd_kafka_cgrp_handle_Metadata (rd_kafka_cgrp_t *rkcg,
                                    rkcg->rkcg_group_leader.member_cnt);
 }
 
+/**
+ * Check if the latest metadata affects the current subscription:
+ * - matched topic added
+ * - matched topic removed
+ * - matched topic's partition count change
+ */
+void rd_kafka_cgrp_metadata_update_check (rd_kafka_cgrp_t *rkcg,
+					  const struct rd_kafka_metadata *md) {
+	rd_list_t *topics;
+
+	rd_kafka_assert(NULL, thrd_is_current(rkcg->rkcg_rk->rk_thread));
+
+	if (!rkcg->rkcg_subscription || rkcg->rkcg_subscription->cnt == 0)
+		return;
+
+	/*
+	 * Create a list of the topics in metadata that matches our subscription
+	 */
+	topics = rd_list_new(rkcg->rkcg_subscription->cnt);
+
+	rd_kafka_metadata_topic_match(rkcg->rkcg_rk,
+				      topics, md, rkcg->rkcg_subscription);
+
+
+	/*
+	 * Update
+	 */
+	if (rd_kafka_cgrp_update_subscribed_topics(rkcg, topics)) {
+		/* List of subscribed topics changed, trigger rejoin. */
+		rd_kafka_cgrp_rejoin(rkcg);
+	}
+}
+
 
 void rd_kafka_cgrp_handle_SyncGroup (rd_kafka_cgrp_t *rkcg,
+				     rd_kafka_broker_t *rkb,
                                      rd_kafka_resp_err_t err,
                                      const rd_kafkap_bytes_t *member_state) {
         rd_kafka_buf_t *rkbuf = NULL;
@@ -1977,9 +2472,22 @@ void rd_kafka_cgrp_handle_SyncGroup (rd_kafka_cgrp_t *rkcg,
                 goto err;
 
 
+	if (RD_KAFKAP_BYTES_LEN(member_state) == 0) {
+		/* Empty assignment. */
+		assignment = rd_kafka_topic_partition_list_new(0);
+		memset(&UserData, 0, sizeof(UserData));
+		goto done;
+	}
+
         /* Parse assignment from MemberState */
         rkbuf = rd_kafka_buf_new_shadow(member_state->data,
                                         RD_KAFKAP_BYTES_LEN(member_state));
+	/* Protocol parser needs a broker handle to log errors on. */
+	if (rkb) {
+		rkbuf->rkbuf_rkb = rkb;
+		rd_kafka_broker_keep(rkb);
+	} else
+		rkbuf->rkbuf_rkb = rd_kafka_broker_internal(rkcg->rkcg_rk);
 
         rd_kafka_buf_read_i16(rkbuf, &Version);
         rd_kafka_buf_read_i32(rkbuf, &TopicCnt);
@@ -2007,7 +2515,10 @@ void rd_kafka_cgrp_handle_SyncGroup (rd_kafka_cgrp_t *rkcg,
         }
 
         rd_kafka_buf_read_bytes(rkbuf, &UserData);
+        rkbuf->rkbuf_buf2 = NULL; /* Avoid free of underlying memory */
+        rd_kafka_buf_destroy(rkbuf);
 
+ done:
         memset(&rkgm, 0, sizeof(rkgm));
         rkgm.rkgm_assignment = assignment;
         rkgm.rkgm_userdata = &UserData;
@@ -2017,8 +2528,6 @@ void rd_kafka_cgrp_handle_SyncGroup (rd_kafka_cgrp_t *rkcg,
 
         rd_kafka_topic_partition_list_destroy(assignment);
 
-        rkbuf->rkbuf_buf2 = NULL; /* Avoid free of underlying memory */
-        rd_kafka_buf_destroy(rkbuf);
         return;
 err:
         if (rkbuf) {

@@ -34,8 +34,6 @@
 extern const char *rd_kafka_broker_state_names[];
 extern const char *rd_kafka_secproto_names[];
 
-#define RD_KAFKA_NODENAME_SIZE  128
-
 struct rd_kafka_broker_s { /* rd_kafka_broker_t */
 	TAILQ_ENTRY(rd_kafka_broker_s) rkb_link;
 
@@ -49,8 +47,18 @@ struct rd_kafka_broker_s { /* rd_kafka_broker_t */
 	rd_kafka_transport_t *rkb_transport;
 
 	uint32_t            rkb_corrid;
+	int                 rkb_connid;    /* Connection id, increased by
+					    * one for each connection by
+					    * this broker. Used as a safe-guard
+					    * to help troubleshooting buffer
+					    * problems across disconnects. */
 
-	rd_kafka_q_t        rkb_ops;
+	rd_kafka_q_t       *rkb_ops;
+
+        mtx_t               rkb_lock;
+
+        int                 rkb_blocking_max_ms; /* Maximum IO poll blocking
+                                                  * time. */
 
         /* Toppars handled by this broker */
 	TAILQ_HEAD(, rd_kafka_toppar_s) rkb_toppars;
@@ -126,7 +134,9 @@ struct rd_kafka_broker_s { /* rd_kafka_broker_t */
 		rd_atomic64_t rx_err;
 		rd_atomic64_t rx_corrid_err; /* CorrId misses */
 		rd_atomic64_t rx_partial;    /* Partial messages received
-					 * and dropped. */
+                                              * and dropped. */
+                rd_atomic64_t zbuf_grow;     /* Compression/decompression buffer grows needed */
+                rd_atomic64_t buf_grow;      /* rkbuf grows needed */
 	} rkb_c;
 
         int                 rkb_req_timeouts;  /* Current value */
@@ -134,7 +144,6 @@ struct rd_kafka_broker_s { /* rd_kafka_broker_t */
 	rd_ts_t             rkb_ts_metadata_poll; /* Next metadata poll time */
 	int                 rkb_metadata_fast_poll_cnt; /* Perform fast
 							 * metadata polls. */
-	mtx_t               rkb_lock;
 	thrd_t              rkb_thread;
 
 	rd_refcnt_t         rkb_refcnt;
@@ -169,6 +178,7 @@ struct rd_kafka_broker_s { /* rd_kafka_broker_t */
 
 	rd_kafka_secproto_t rkb_proto;
 
+	int                 rkb_down_reported;    /* Down event reported */
 #if WITH_SASL
 	rd_kafka_timer_t    rkb_sasl_kinit_refresh_tmr;
 #endif
@@ -226,6 +236,9 @@ rd_kafka_broker_t *rd_kafka_broker_any (rd_kafka_t *rk, int state,
                                         int (*filter) (rd_kafka_broker_t *rkb,
                                                        void *opaque),
                                         void *opaque);
+
+rd_kafka_broker_t *rd_kafka_broker_any_usable (rd_kafka_t *rk, int timeout_ms);
+
 rd_kafka_broker_t *rd_kafka_broker_prefer (rd_kafka_t *rk, int32_t broker_id, int state);
 
 int rd_kafka_brokers_add0 (rd_kafka_t *rk, const char *brokerlist);
@@ -270,7 +283,7 @@ void rd_kafka_broker_buf_enq1 (rd_kafka_broker_t *rkb,
 void rd_kafka_broker_buf_enq_replyq (rd_kafka_broker_t *rkb,
                                      int16_t ApiKey,
                                      rd_kafka_buf_t *rkbuf,
-                                     rd_kafka_q_t *replyq,
+                                     rd_kafka_replyq_t replyq,
                                      rd_kafka_resp_cb_t *resp_cb,
                                      void *opaque);
 
@@ -279,9 +292,10 @@ void rd_kafka_broker_buf_retry (rd_kafka_broker_t *rkb, rd_kafka_buf_t *rkbuf);
 void rd_kafka_broker_metadata_req (rd_kafka_broker_t *rkb,
                                    int all_topics,
                                    rd_kafka_itopic_t *only_rkt,
-                                   rd_kafka_q_t *replyq,
+                                   rd_kafka_replyq_t replyq,
                                    const char *reason);
-
+void rd_kafka_broker_metadata_req_op (rd_kafka_broker_t *rkb,
+				      rd_kafka_op_t *rko);
 
 rd_kafka_broker_t *rd_kafka_broker_internal (rd_kafka_t *rk);
 
@@ -290,3 +304,8 @@ void msghdr_print (rd_kafka_t *rk,
 		   int hexdump);
 
 const char *rd_kafka_broker_name (rd_kafka_broker_t *rkb);
+
+int rd_kafka_brokers_get_state_version (rd_kafka_t *rk);
+int rd_kafka_brokers_wait_state_change (rd_kafka_t *rk, int stored_version,
+					int timeout_ms);
+void rd_kafka_brokers_broadcast_state_change (rd_kafka_t *rk);

@@ -82,7 +82,7 @@ void rd_list_prealloc_elems (rd_list_t *rl, size_t elemsize, size_t size) {
 	for (i = 0 ; i < size ; i++, p += elemsize)
 		rl->rl_elems[i] = p;
 
-	rl->rl_size = size;
+	rl->rl_size = (int)size;
 	rl->rl_cnt = 0;
 	rl->rl_flags |= RD_LIST_F_FIXED_SIZE;
 }
@@ -223,4 +223,22 @@ void *rd_list_find (const rd_list_t *rl, const void *match,
         }
 
         return NULL;
+}
+
+
+int rd_list_cmp (const rd_list_t *a, rd_list_t *b,
+		 int (*cmp) (const void *, const void *)) {
+	int i;
+
+	i = a->rl_cnt - b->rl_cnt;
+	if (i)
+		return i;
+
+	for (i = 0 ; i < a->rl_cnt ; i++) {
+		int r = cmp(a->rl_elems[i], b->rl_elems[i]);
+		if (r)
+			return r;
+	}
+
+	return 0;
 }

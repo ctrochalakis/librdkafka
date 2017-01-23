@@ -37,22 +37,102 @@
 
 #include "rdsysqueue.h"
 
+#include <stdarg.h>
+
 void rd_kafka_msg_destroy (rd_kafka_t *rk, rd_kafka_msg_t *rkm) {
 
-	rd_kafka_assert(rk, rd_atomic32_get(&rk->rk_producer.msg_cnt) > 0);
-	(void)rd_atomic32_sub(&rk->rk_producer.msg_cnt, 1);
+	if (rkm->rkm_flags & RD_KAFKA_MSG_F_ACCOUNT) {
+		rd_dassert(rk || rkm->rkm_rkmessage.rkt);
+		rd_kafka_curr_msgs_sub(
+			rk ? rk :
+			rd_kafka_topic_a2i(rkm->rkm_rkmessage.rkt)->rkt_rk,
+			1, rkm->rkm_len);
+	}
+
+	if (likely(rkm->rkm_rkmessage.rkt != NULL))
+		rd_kafka_topic_destroy0(
+                        rd_kafka_topic_a2s(rkm->rkm_rkmessage.rkt));
 
 	if (rkm->rkm_flags & RD_KAFKA_MSG_F_FREE && rkm->rkm_payload)
 		rd_free(rkm->rkm_payload);
 
-	if (rkm->rkm_key)
-		rd_kafkap_bytes_destroy(rkm->rkm_key);
-
-	rd_free(rkm);
+	if (rkm->rkm_flags & RD_KAFKA_MSG_F_FREE_RKM)
+		rd_free(rkm);
 }
 
+
+
+
 /**
- * Create a new message.
+ * @brief Create a new message, copying the payload as indicated by msgflags.
+ *
+ * @returns the new message
+ */
+rd_kafka_msg_t *rd_kafka_msg_new00 (rd_kafka_itopic_t *rkt,
+				    int32_t partition,
+				    int msgflags,
+				    char *payload, size_t len,
+				    const void *key, size_t keylen,
+				    void *msg_opaque) {
+	rd_kafka_msg_t *rkm;
+	size_t mlen = sizeof(*rkm);
+	char *p;
+
+	/* If we are to make a copy of the payload, allocate space for it too */
+	if (msgflags & RD_KAFKA_MSG_F_COPY) {
+		msgflags &= ~RD_KAFKA_MSG_F_FREE;
+		mlen += len;
+	}
+
+	mlen += keylen;
+
+	/* Note: using rd_malloc here, not rd_calloc, so make sure all fields
+	 *       are properly set up. */
+	rkm                 = rd_malloc(mlen);
+	rkm->rkm_err        = 0;
+	rkm->rkm_flags      = RD_KAFKA_MSG_F_FREE_RKM | msgflags;
+	rkm->rkm_len        = len;
+	rkm->rkm_opaque     = msg_opaque;
+	rkm->rkm_rkmessage.rkt = rd_kafka_topic_keep_a(rkt);
+
+	rkm->rkm_partition  = partition;
+        rkm->rkm_offset     = 0;
+	rkm->rkm_timestamp  = 0;
+	rkm->rkm_tstype     = RD_KAFKA_TIMESTAMP_NOT_AVAILABLE;
+
+	p = (char *)(rkm+1);
+
+	if (payload && msgflags & RD_KAFKA_MSG_F_COPY) {
+		/* Copy payload to space following the ..msg_t */
+		rkm->rkm_payload = p;
+		memcpy(rkm->rkm_payload, payload, len);
+		p += len;
+
+	} else {
+		/* Just point to the provided payload. */
+		rkm->rkm_payload = payload;
+	}
+
+	if (key) {
+		rkm->rkm_key     = p;
+		rkm->rkm_key_len = keylen;
+		memcpy(rkm->rkm_key, key, keylen);
+	} else {
+		rkm->rkm_key = NULL;
+		rkm->rkm_key_len = 0;
+	}
+
+
+        return rkm;
+}
+
+
+
+
+/**
+ * @brief Create a new message.
+ *
+ * @remark Must only be used by producer code.
  *
  * Returns 0 on success or -1 on error.
  * Both errno and 'errp' are set appropriately.
@@ -68,14 +148,14 @@ static rd_kafka_msg_t *rd_kafka_msg_new0 (rd_kafka_itopic_t *rkt,
 					  rd_ts_t utc_now,
                                           rd_ts_t now) {
 	rd_kafka_msg_t *rkm;
-	size_t mlen = sizeof(*rkm);
 
 	if (unlikely(!payload))
 		len = 0;
 	if (!key)
 		keylen = 0;
 
-	if (unlikely(len + keylen > (size_t)rkt->rkt_rk->rk_conf.max_msg_size ||
+	if (unlikely(len + keylen >
+		     (size_t)rkt->rkt_rk->rk_conf.max_msg_size ||
 		     keylen > INT32_MAX)) {
 		*errp = RD_KAFKA_RESP_ERR_MSG_SIZE_TOO_LARGE;
 		if (errnop)
@@ -83,38 +163,27 @@ static rd_kafka_msg_t *rd_kafka_msg_new0 (rd_kafka_itopic_t *rkt,
 		return NULL;
 	}
 
-	/* If we are to make a copy of the payload, allocate space for it too */
-	if (msgflags & RD_KAFKA_MSG_F_COPY) {
-		msgflags &= ~RD_KAFKA_MSG_F_FREE;
-		mlen += len;
+	*errp = rd_kafka_curr_msgs_add(rkt->rkt_rk, 1, len,
+				       msgflags & RD_KAFKA_MSG_F_BLOCK);
+	if (unlikely(*errp)) {
+		if (errnop)
+			*errnop = ENOBUFS;
+		return NULL;
 	}
 
-	/* Note: using rd_malloc here, not rd_calloc, so make sure all fields
-	 *       are properly set up. */
-	rkm = rd_malloc(mlen);
-	rkm->rkm_len        = len;
-	rkm->rkm_flags      = msgflags;
-	rkm->rkm_opaque     = msg_opaque;
-	rkm->rkm_key        = rd_kafkap_bytes_new(key, (int32_t) keylen);
-	rkm->rkm_partition  = force_partition;
-        rkm->rkm_offset     = 0;
+
+	rkm = rd_kafka_msg_new00(rkt, force_partition,
+				 msgflags|RD_KAFKA_MSG_F_ACCOUNT /* curr_msgs_add() */,
+				 payload, len, key, keylen, msg_opaque);
+
 	rkm->rkm_timestamp  = utc_now / 1000;
+	rkm->rkm_tstype     = RD_KAFKA_TIMESTAMP_CREATE_TIME;
 
 	if (rkt->rkt_conf.message_timeout_ms == 0) {
 		rkm->rkm_ts_timeout = INT64_MAX;
 	} else {
 		rkm->rkm_ts_timeout = now +
 			rkt->rkt_conf.message_timeout_ms * 1000;
-	}
-
-	if (payload && msgflags & RD_KAFKA_MSG_F_COPY) {
-		/* Copy payload to space following the ..msg_t */
-		rkm->rkm_payload = (void *)(rkm+1);
-		memcpy(rkm->rkm_payload, payload, len);
-
-	} else {
-		/* Just point to the provided payload. */
-		rkm->rkm_payload = payload;
 	}
 
         return rkm;
@@ -140,21 +209,12 @@ int rd_kafka_msg_new (rd_kafka_itopic_t *rkt, int32_t force_partition,
 	rd_kafka_resp_err_t err;
 	int errnox;
 
-	if (unlikely(rd_atomic32_add(&rkt->rkt_rk->rk_producer.msg_cnt, 1) >
-		     rkt->rkt_rk->rk_conf.queue_buffering_max_msgs)) {
-		(void)rd_atomic32_sub(&rkt->rkt_rk->rk_producer.msg_cnt, 1);
-		rd_kafka_set_last_error(RD_KAFKA_RESP_ERR__QUEUE_FULL,
-					ENOBUFS);
-		return -1;
-	}
-
         /* Create message */
         rkm = rd_kafka_msg_new0(rkt, force_partition, msgflags, 
                                 payload, len, key, keylen, msg_opaque,
 				&err, &errnox, rd_uclock(), rd_clock());
         if (unlikely(!rkm)) {
                 /* errno is already set by msg_new() */
-                (void)rd_atomic32_sub(&rkt->rkt_rk->rk_producer.msg_cnt, 1);
 		rd_kafka_set_last_error(err, errnox);
                 return -1;
         }
@@ -220,20 +280,6 @@ int rd_kafka_produce_batch (rd_kafka_topic_t *app_rkt, int32_t partition,
                         continue;
                 }
 
-                /* buffering.max.messages reached */
-                if (unlikely(rd_atomic32_get(&rkt->rkt_rk->rk_producer.msg_cnt) +
-                             /* For partitioner: msg_cnt is increased per
-                              *                  message,
-                              * For single partition: msg_cnt is increased
-                              *                       just once at the end */
-                             (partition == RD_KAFKA_PARTITION_UA ? 0 : good)
-                             + 1 >
-                             rkt->rkt_rk->rk_conf.queue_buffering_max_msgs)) {
-                        all_err = RD_KAFKA_RESP_ERR__QUEUE_FULL;
-                        rkmessages[i].err = all_err;
-                        continue;
-                }
-
                 /* Create message */
                 rkm = rd_kafka_msg_new0(rkt,
                                         partition , msgflags,
@@ -244,16 +290,16 @@ int rd_kafka_produce_batch (rd_kafka_topic_t *app_rkt, int32_t partition,
                                         rkmessages[i]._private,
                                         &rkmessages[i].err,
 					NULL, utc_now, now);
-                if (!rkm)
+                if (unlikely(!rkm)) {
+			if (rkmessages[i].err == RD_KAFKA_RESP_ERR__QUEUE_FULL)
+				all_err = rkmessages[i].err;
                         continue;
+		}
 
                 /* Two cases here:
                  *  partition==UA:     run the partitioner (slow)
                  *  fixed partition:   simply concatenate the queue to partit */
                 if (partition == RD_KAFKA_PARTITION_UA) {
-                        (void)rd_atomic32_add(&rkt->rkt_rk->rk_producer.msg_cnt,
-                                            1);
-
                         /* Partition the message */
                         rkmessages[i].err =
                                 rd_kafka_msg_partitioner(rkt, rkm,
@@ -288,10 +334,6 @@ int rd_kafka_produce_batch (rd_kafka_topic_t *app_rkt, int32_t partition,
                 /* Concatenate tmpq onto partition queue. */
                 if (likely(s_rktp != NULL)) {
                         rd_kafka_toppar_t *rktp = rd_kafka_toppar_s2i(s_rktp);
-                        if (good > 0)
-                                (void)rd_atomic32_add(&rkt->rkt_rk->
-                                                    rk_producer.msg_cnt, good);
-
                         rd_atomic64_add(&rktp->rktp_c.msgs, good);
                         rd_kafka_toppar_concat_msgq(rktp, &tmpq);
                         rd_kafka_toppar_destroy(s_rktp);
@@ -419,23 +461,20 @@ int rd_kafka_msg_partitioner (rd_kafka_itopic_t *rkt, rd_kafka_msg_t *rkm,
                 /* Partition not assigned, run partitioner. */
                 if (rkm->rkm_partition == RD_KAFKA_PARTITION_UA) {
                         rd_kafka_topic_t *app_rkt;
-                        /* Provide a temporary app_rkt instance
-                         * if the application decided to destroy its
-                         * topic prior to delivery completion (issue #502) */
-                        if (unlikely(!(app_rkt = rkt->rkt_app_rkt)))
-                                app_rkt = rd_kafka_topic_keep_a(rkt);
+                        /* Provide a temporary app_rkt instance to protect
+                         * from the case where the application decided to
+                         * destroy its topic object prior to delivery completion
+                         * (issue #502). */
+                        app_rkt = rd_kafka_topic_keep_a(rkt);
                         partition = rkt->rkt_conf.
                                 partitioner(app_rkt,
-                                            rkm->rkm_key->data,
-                                            RD_KAFKAP_BYTES_LEN(rkm->
-                                                                rkm_key),
+                                            rkm->rkm_key,
+					    rkm->rkm_key_len,
                                             rkt->rkt_partition_cnt,
                                             rkt->rkt_conf.opaque,
                                             rkm->rkm_opaque);
-
-                        if (unlikely(!rkt->rkt_app_rkt))
-                                rd_kafka_topic_destroy0(
-                                        rd_kafka_topic_a2s(app_rkt));
+                        rd_kafka_topic_destroy0(
+                                rd_kafka_topic_a2s(app_rkt));
                 } else
                         partition = rkm->rkm_partition;
 

@@ -94,11 +94,13 @@ rd_kafka_group_member_find_subscription (rd_kafka_t *rk,
 
 static rd_kafkap_bytes_t *
 rd_kafka_consumer_protocol_member_metadata_new (
-        const rd_kafka_topic_partition_list_t *subscription,
+	const rd_list_t *topics,
         const void *userdata, size_t userdata_size) {
         rd_kafka_buf_t *rkbuf;
         rd_kafkap_bytes_t *kbytes;
         int i;
+	int topic_cnt = rd_list_cnt(topics);
+	const rd_kafka_topic_info_t *tinfo;
 
         /*
          * MemberMetadata => Version Subscription AssignmentStrategies
@@ -110,13 +112,13 @@ rd_kafka_consumer_protocol_member_metadata_new (
 
         rkbuf = rd_kafka_buf_new_growable(NULL, 1,
                                           100 +
-                                          (subscription->cnt * 100) +
+					  (topic_cnt * 100) +
                                           userdata_size);
 
         rd_kafka_buf_write_i16(rkbuf, 0);
-        rd_kafka_buf_write_i32(rkbuf, subscription->cnt);
-        for (i = 0 ; i < subscription->cnt ; i++)
-                rd_kafka_buf_write_str(rkbuf, subscription->elems[i].topic,-1);
+        rd_kafka_buf_write_i32(rkbuf, topic_cnt);
+	RD_LIST_FOREACH(tinfo, topics, i)
+                rd_kafka_buf_write_str(rkbuf, tinfo->topic, -1);
 	if (userdata)
 		rd_kafka_buf_write_bytes(rkbuf, userdata, userdata_size);
 	else /* Kafka 0.9.0.0 cant parse NULL bytes, so we provide empty. */
@@ -137,10 +139,9 @@ rd_kafka_consumer_protocol_member_metadata_new (
 
 rd_kafkap_bytes_t *
 rd_kafka_assignor_get_metadata (rd_kafka_assignor_t *rkas,
-                                const rd_kafka_topic_partition_list_t
-                                *subscription) {
+				const rd_list_t *topics) {
         return rd_kafka_consumer_protocol_member_metadata_new(
-                subscription, rkas->rkas_userdata,
+                topics, rkas->rkas_userdata,
                 rkas->rkas_userdata_size);
 }
 
@@ -210,7 +211,8 @@ rd_kafka_member_subscriptions_map (rd_kafka_cgrp_t *rkcg,
                 int i;
 
                 /* Ignore topics in blacklist */
-                if (rd_kafka_pattern_match(&rkcg->rkcg_rk->rk_conf.
+                if (rkcg->rkcg_rk->rk_conf.topic_blacklist &&
+		    rd_kafka_pattern_match(rkcg->rkcg_rk->rk_conf.
                                            topic_blacklist,
                                            metadata->topics[ti].topic)) {
                         rd_kafka_dbg(rkcg->rkcg_rk, TOPIC, "BLACKLIST",
@@ -516,8 +518,12 @@ int rd_kafka_assignors_init (rd_kafka_t *rk, char *errstr, size_t errstr_size) {
 				rk, &rkas, "consumer", "roundrobin",
 				rd_kafka_roundrobin_assignor_assign_cb,
 				NULL);
-		else /* Input already validatd by .._conf.c */
-			RD_NOTREACHED();
+		else {
+			rd_snprintf(errstr, errstr_size,
+				    "Unsupported partition.assignment.strategy:"
+				    " %s", s);
+			return -1;
+		}
 
 		if (rkas) {
 			if (!rkas->rkas_enabled) {

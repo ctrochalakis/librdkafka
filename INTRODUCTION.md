@@ -98,7 +98,7 @@ of messages to accumulate in the local queue before sending them off in
 one large message set or batch to the peer. This amortizes the messaging
 overhead and eliminates the adverse effect of the round trip time (rtt).
 
-The default settings, batch.num.messages=1000 and queue.buffering.max.ms=1000,
+The default settings, batch.num.messages=10000 and queue.buffering.max.ms=1000,
 are suitable for high throughput. This allows librdkafka to wait up to
 1000 ms for up to 1000 messages to accumulate in the local queue before
 sending the accumulate messages to the broker.
@@ -310,7 +310,6 @@ The `rd_kafka_produce()` function takes the following arguments:
   * `partition` - partition to produce to. If this is set to
 	  `RD_KAFKA_PARTITION_UA` (UnAssigned) then the configured partitioner
 		  function will be used to select a target partition.
-  * `payload`,`len` - the message payload
   * `msgflags` - 0, or one of:
 	  * `RD_KAFKA_MSG_F_COPY` - librdkafka will immediately make a copy of
 	    the payload. Use this when the payload is in non-persistent
@@ -329,7 +328,7 @@ The `rd_kafka_produce()` function takes the following arguments:
 	payload memory.
 	The application must not free the payload in the delivery report
 	callback if `RD_KAFKA_MSG_F_FREE is set`.
-	
+  * `payload`,`len` - the message payload
   * `key`,`keylen` - an optional message key which can be used for partitioning.
 	  It will be passed to the topic partitioner callback, if any, and
 	  will be attached to the message when sending to the broker.

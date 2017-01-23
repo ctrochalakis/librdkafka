@@ -56,18 +56,28 @@ extern "C" {
 
 #ifdef _MSC_VER
 #include <basetsd.h>
+#ifndef WIN32_MEAN_AND_LEAN
+#define WIN32_MEAN_AND_LEAN
+#endif
+#include <Winsock2.h>  /* for sockaddr, .. */
 typedef SSIZE_T ssize_t;
 #define RD_UNUSED
 #define RD_INLINE __inline
 #define RD_DEPRECATED
 #undef RD_EXPORT
+#ifdef LIBRDKAFKA_STATICLIB
+#define RD_EXPORT
+#else
 #ifdef LIBRDKAFKA_EXPORTS
 #define RD_EXPORT __declspec(dllexport)
 #else
 #define RD_EXPORT __declspec(dllimport)
 #endif
+#endif
 
 #else
+#include <sys/socket.h> /* for sockaddr, .. */
+
 #define RD_UNUSED __attribute__((unused))
 #define RD_INLINE inline
 #define RD_EXPORT
@@ -98,7 +108,7 @@ typedef SSIZE_T ssize_t;
  * @remark This value should only be used during compile time,
  *         for runtime checks of version use rd_kafka_version()
  */
-#define RD_KAFKA_VERSION  0x000901ff
+#define RD_KAFKA_VERSION  0x000903ff
 
 /**
  * @brief Returns the librdkafka version as integer.
@@ -173,7 +183,7 @@ const char *rd_kafka_get_debug_contexts(void);
  *             Use rd_kafka_get_debug_contexts() instead.
  */
 #define RD_KAFKA_DEBUG_CONTEXTS \
-	"all,generic,broker,topic,metadata,producer,queue,msg,protocol,cgrp,security,fetch"
+	"all,generic,broker,topic,metadata,queue,msg,protocol,cgrp,security,fetch,feature"
 
 
 /* @cond NO_DOC */
@@ -269,6 +279,9 @@ typedef enum {
 	RD_KAFKA_RESP_ERR__NO_OFFSET = -168,
 	/** Outdated */
 	RD_KAFKA_RESP_ERR__OUTDATED = -167,
+	/** Timed out in queue */
+	RD_KAFKA_RESP_ERR__TIMED_OUT_QUEUE = -166,
+
 	/** End internal error codes */
 	RD_KAFKA_RESP_ERR__END = -100,
 
@@ -485,6 +498,13 @@ typedef struct rd_kafka_topic_partition_s {
                                          *   INITIALIZE TO ZERO, DO NOT TOUCH */
 } rd_kafka_topic_partition_t;
 
+
+/**
+ * @brief Destroy a rd_kafka_topic_partition_t.
+ * @remark This must not be called for elements in a topic partition list.
+ */
+RD_EXPORT
+void rd_kafka_topic_partition_destroy (rd_kafka_topic_partition_t *rktpar);
 
 
 /**
@@ -801,7 +821,7 @@ rd_kafka_conf_t *rd_kafka_conf_dup(const rd_kafka_conf_t *conf);
 /**
  * @brief Sets a configuration property.
  *
- * \p must have been previously created with rd_kafka_conf_new().
+ * \p conf must have been previously created with rd_kafka_conf_new().
  *
  * Returns \c rd_kafka_conf_res_t to indicate success or failure.
  * In case of failure \p errstr is updated to contain a human readable
@@ -812,6 +832,15 @@ rd_kafka_conf_res_t rd_kafka_conf_set(rd_kafka_conf_t *conf,
 				       const char *name,
 				       const char *value,
 				       char *errstr, size_t errstr_size);
+
+
+/**
+ * @brief Enable event sourcing.
+ * \p events is a bitmask of \c RD_KAFKA_EVENT_* of events to enable
+ * for consumption by `rd_kafka_queue_poll()`.
+ */
+RD_EXPORT
+void rd_kafka_conf_set_events(rd_kafka_conf_t *conf, int events);
 
 
 /**
@@ -1038,12 +1067,49 @@ void rd_kafka_conf_set_stats_cb(rd_kafka_conf_t *conf,
  * Default:
  *  - on linux: racefree CLOEXEC
  *  - others  : non-racefree CLOEXEC
+ *
+ * @remark The callback will be called from an internal librdkafka thread.
  */
 RD_EXPORT
 void rd_kafka_conf_set_socket_cb(rd_kafka_conf_t *conf,
                                   int (*socket_cb) (int domain, int type,
                                                     int protocol,
                                                     void *opaque));
+
+
+
+/**
+ * @brief Set connect callback.
+ *
+ * The connect callback is responsible for connecting socket \p sockfd
+ * to peer address \p addr.
+ * The \p id field contains the broker identifier.
+ *
+ * \p connect_cb shall return 0 on success (socket connected) or an error
+ * number (errno) on error.
+ *
+ * @remark The callback will be called from an internal librdkafka thread.
+ */
+RD_EXPORT void
+rd_kafka_conf_set_connect_cb (rd_kafka_conf_t *conf,
+                              int (*connect_cb) (int sockfd,
+                                                 const struct sockaddr *addr,
+                                                 int addrlen,
+                                                 const char *id,
+                                                 void *opaque));
+
+/**
+ * @brief Set close socket callback.
+ *
+ * Close a socket (optionally opened with socket_cb()).
+ *
+ * @remark The callback will be called from an internal librdkafka thread.
+ */
+RD_EXPORT void
+rd_kafka_conf_set_closesocket_cb (rd_kafka_conf_t *conf,
+                                  int (*closesocket_cb) (int sockfd,
+                                                         void *opaque));
+
 
 
 #ifndef _MSC_VER
@@ -1058,6 +1124,8 @@ void rd_kafka_conf_set_socket_cb(rd_kafka_conf_t *conf,
  * Default:
  *  - on linux: racefree CLOEXEC
  *  - others  : non-racefree CLOEXEC
+ *
+ * @remark The callback will be called from an internal librdkafka thread.
  */
 RD_EXPORT
 void rd_kafka_conf_set_open_cb (rd_kafka_conf_t *conf,
@@ -1327,8 +1395,8 @@ int32_t rd_kafka_msg_partitioner_consistent_random (const rd_kafka_topic_t *rkt,
  *
  * \p conf is an optional struct created with `rd_kafka_conf_new()` that will
  * be used instead of the default configuration.
- * The \p conf object is freed by this function and must not be used or
- * destroyed by the application sub-sequently.
+ * The \p conf object is freed by this function on success and must not be used
+ * or destroyed by the application sub-sequently.
  * See `rd_kafka_conf_set()` et.al for more information.
  *
  * \p errstr must be a pointer to memory of at least size \p errstr_size where
@@ -1411,7 +1479,12 @@ rd_kafka_topic_t *rd_kafka_topic_new(rd_kafka_t *rk, const char *topic,
 
 
 /**
- * @brief Destroy topic handle previously created with `rd_kafka_topic_new()`.
+ * @brief Loose application's topic handle refcount as previously created
+ *        with `rd_kafka_topic_new()`.
+ *
+ * @remark Since topic objects are refcounted (both internally and for the app)
+ *         the topic object might not actually be destroyed by this call,
+ *         but the application must consider the object destroyed.
  */
 RD_EXPORT
 void rd_kafka_topic_destroy(rd_kafka_topic_t *rkt);
@@ -1594,6 +1667,65 @@ rd_kafka_queue_t *rd_kafka_queue_new(rd_kafka_t *rk);
 RD_EXPORT
 void rd_kafka_queue_destroy(rd_kafka_queue_t *rkqu);
 
+
+/**
+ * @returns a reference to the main librdkafka event queue.
+ * This is the queue served by rd_kafka_poll().
+ *
+ * Use rd_kafka_queue_destroy() to loose the reference.
+ */
+RD_EXPORT
+rd_kafka_queue_t *rd_kafka_queue_get_main (rd_kafka_t *rk);
+
+
+/**
+ * @returns a reference to the librdkafka consumer queue.
+ * This is the queue served by rd_kafka_consumer_poll().
+ *
+ * Use rd_kafka_queue_destroy() to loose the reference.
+ *
+ * @remark rd_kafka_queue_destroy() MUST be called on this queue
+ *         prior to calling rd_kafka_consumer_close().
+ */
+RD_EXPORT
+rd_kafka_queue_t *rd_kafka_queue_get_consumer (rd_kafka_t *rk);
+
+
+/**
+ * @brief Forward/re-route queue \p src to \p dst.
+ * If \p dst is \c NULL the forwarding is removed.
+ *
+ * The internal refcounts for both queues are increased.
+ */
+RD_EXPORT
+void rd_kafka_queue_forward (rd_kafka_queue_t *src, rd_kafka_queue_t *dst);
+
+
+/**
+ * @returns the current number of elements in queue.
+ */
+RD_EXPORT
+size_t rd_kafka_queue_length (rd_kafka_queue_t *rkqu);
+
+
+/**
+ * @brief Enable IO event triggering for queue.
+ *
+ * To ease integration with IO based polling loops this API
+ * allows an application to create a separate file-descriptor
+ * that librdkafka will write \p payload (of size \p size) to
+ * whenever a new element is enqueued on a previously empty queue.
+ *
+ * To remove event triggering call with \p fd = -1.
+ *
+ * librdkafka will maintain a copy of the \p payload.
+ *
+ * @remark When using forwarded queues the IO event must only be enabled
+ *         on the final forwarded-to (destination) queue.
+ */
+RD_EXPORT
+void rd_kafka_queue_io_event_enable (rd_kafka_queue_t *rkqu, int fd,
+				     const void *payload, size_t size);
 
 /**@}*/
 
@@ -1962,7 +2094,6 @@ rd_kafka_message_t *rd_kafka_consumer_poll (rd_kafka_t *rk, int timeout_ms);
  * @remark The application still needs to call rd_kafka_destroy() after
  *         this call finishes to clean up the underlying handle resources.
  *
- *
  */
 RD_EXPORT
 rd_kafka_resp_err_t rd_kafka_consumer_close (rd_kafka_t *rk);
@@ -1971,6 +2102,16 @@ rd_kafka_resp_err_t rd_kafka_consumer_close (rd_kafka_t *rk);
 
 /**
  * @brief Atomic assignment of partitions to consume.
+ *
+ * The new \p partitions will replace the existing assignment.
+ *
+ * When used from a rebalance callback the application shall pass the
+ * partition list passed to the callback (or a copy of it) (even if the list
+ * is empty) rather than NULL to maintain internal join state.
+
+ * A zero-length \p partitions will treat the partitions as a valid,
+ * albeit empty, assignment, and maintain internal state, while a \c NULL
+ * value for \p partitions will reset and clear the internal state.
  */
 RD_EXPORT rd_kafka_resp_err_t
 rd_kafka_assign (rd_kafka_t *rk,
@@ -2003,7 +2144,9 @@ rd_kafka_assignment (rd_kafka_t *rk,
  * is done, returning the resulting success or error code.
  *
  * If a rd_kafka_conf_set_offset_commit_cb() offset commit callback has been
- * configured a callback will be enqueued for a future call to rd_kafka_poll().
+ * configured:
+ *  * if async: callback will be enqueued for a future call to rd_kafka_poll().
+ *  * if !async: callback will be called from rd_kafka_commit()
  */
 RD_EXPORT rd_kafka_resp_err_t
 rd_kafka_commit (rd_kafka_t *rk, const rd_kafka_topic_partition_list_t *offsets,
@@ -2012,12 +2155,44 @@ rd_kafka_commit (rd_kafka_t *rk, const rd_kafka_topic_partition_list_t *offsets,
 
 /**
  * @brief Commit message's offset on broker for the message's partition.
+ *
+ * @sa rd_kafka_commit
  */
 RD_EXPORT rd_kafka_resp_err_t
 rd_kafka_commit_message (rd_kafka_t *rk, const rd_kafka_message_t *rkmessage,
                          int async);
 
 
+/**
+ * @brief Commit offsets on broker for the provided list of partitions.
+ *
+ * See rd_kafka_commit for \p offsets semantics.
+ *
+ * The result of the offset commit will be posted on the provided \p rkqu queue.
+ *
+ * If the application uses one of the poll APIs (rd_kafka_poll(),
+ * rd_kafka_consumer_poll(), rd_kafka_queue_poll(), ..) to serve the queue
+ * the \p cb callback is required. \p opaque is passed to the callback.
+ *
+ * If using the event API the callback is ignored and the offset commit result
+ * will be returned as an RD_KAFKA_EVENT_COMMIT event. The \p opaque
+ * value will be available with rd_kafka_event_opaque()
+ *
+ * If \p rkqu is NULL a temporary queue will be created and the callback will
+ * be served by this call.
+ *
+ * @sa rd_kafka_commit()
+ * @sa rd_kafka_conf_set_offset_commit_cb()
+ */
+RD_EXPORT rd_kafka_resp_err_t
+rd_kafka_commit_queue (rd_kafka_t *rk,
+		       const rd_kafka_topic_partition_list_t *offsets,
+		       rd_kafka_queue_t *rkqu,
+		       void (*cb) (rd_kafka_t *rk,
+				   rd_kafka_resp_err_t err,
+				   rd_kafka_topic_partition_list_t *offsets,
+				   void *opaque),
+		       void *opaque);
 
 
 /**
@@ -2073,6 +2248,18 @@ rd_kafka_position (rd_kafka_t *rk,
  */
 #define RD_KAFKA_MSG_F_FREE  0x1 /**< Delegate freeing of payload to rdkafka. */
 #define RD_KAFKA_MSG_F_COPY  0x2 /**< rdkafka will make a copy of the payload. */
+#define RD_KAFKA_MSG_F_BLOCK 0x4 /**< Block produce*() on message queue full.
+				  *   WARNING: If a delivery report callback
+				  *            is used the application MUST
+				  *            call rd_kafka_poll() (or equiv.)
+				  *            to make sure delivered messages
+				  *            are drained from the internal
+				  *            delivery report queue.
+				  *            Failure to do so will result
+				  *            in indefinately blocking on
+				  *            the produce() call when the
+				  *            message queue is full.
+				  */
 
 
 
@@ -2090,6 +2277,17 @@ rd_kafka_position (rd_kafka_t *rk,
  *   - a fixed partition (0..N)
  *
  * \p msgflags is zero or more of the following flags OR:ed together:
+ *    RD_KAFKA_MSG_F_BLOCK - block \p produce*() call if
+ *                           \p queue.buffering.max.messages or
+ *                           \p queue.buffering.max.kbytes are exceeded.
+ *                           Messages are considered in-queue from the point they
+ *                           are accepted by produce() until their corresponding
+ *                           delivery report callback/event returns.
+ *                           It is thus a requirement to call 
+ *                           rd_kafka_poll() (or equiv.) from a separate
+ *                           thread when F_BLOCK is used.
+ *                           See WARNING on \c RD_KAFKA_MSG_F_BLOCK above.
+ *
  *    RD_KAFKA_MSG_F_FREE - rdkafka will free(3) \p payload when it is done
  *                          with it.
  *    RD_KAFKA_MSG_F_COPY - the \p payload data will be copied and the 
@@ -2162,6 +2360,21 @@ int rd_kafka_produce_batch(rd_kafka_topic_t *rkt, int32_t partition,
                             rd_kafka_message_t *rkmessages, int message_cnt);
 
 
+
+
+/**
+ * @brief Wait until all outstanding produce requests, et.al, are completed.
+ *        This should typically be done prior to destroying a producer instance
+ *        to make sure all queued and in-flight produce requests are completed
+ *        before terminating.
+ *
+ * @remark This function will call rd_kafka_poll() and thus trigger callbacks.
+ *
+ * @returns RD_KAFKA_RESP_ERR__TIMED_OUT if \p timeout_ms was reached before all
+ *          outstanding requests were completed, else RD_KAFKA_RESP_ERR_NO_ERROR
+ */
+RD_EXPORT
+rd_kafka_resp_err_t rd_kafka_flush (rd_kafka_t *rk, int timeout_ms);
 
 
 /**@}*/
@@ -2498,6 +2711,193 @@ int rd_kafka_wait_destroyed(int timeout_ms);
  */
 RD_EXPORT
 rd_kafka_resp_err_t rd_kafka_poll_set_consumer (rd_kafka_t *rk);
+
+
+/**@}*/
+
+/**
+ * @name Event interface
+ *
+ * @brief The event API provides an alternative pollable non-callback interface
+ *        to librdkafka's message and event queues.
+ *
+ * @{
+ */
+
+
+/**
+ * @brief Event types
+ */
+typedef int rd_kafka_event_type_t;
+#define RD_KAFKA_EVENT_NONE          0x0
+#define RD_KAFKA_EVENT_DR            0x1  /**< Producer Delivery report batch */
+#define RD_KAFKA_EVENT_FETCH         0x2  /**< Fetched message (consumer) */
+#define RD_KAFKA_EVENT_LOG           0x4  /**< Log message */
+#define RD_KAFKA_EVENT_ERROR         0x8  /**< Error */
+#define RD_KAFKA_EVENT_REBALANCE     0x10 /**< Group rebalance (consumer) */
+#define RD_KAFKA_EVENT_OFFSET_COMMIT 0x20 /**< Offset commit result */
+
+
+typedef struct rd_kafka_op_s rd_kafka_event_t;
+
+
+/**
+ * @returns the event type for the given event.
+ *
+ * @remark As a convenience it is okay to pass \p rkev as NULL in which case
+ *         RD_KAFKA_EVENT_NONE is returned.
+ */
+RD_EXPORT
+rd_kafka_event_type_t rd_kafka_event_type (const rd_kafka_event_t *rkev);
+
+/**
+ * @returns the event type's name for the given event.
+ *
+ * @remark As a convenience it is okay to pass \p rkev as NULL in which case
+ *         the name for RD_KAFKA_EVENT_NONE is returned.
+ */
+RD_EXPORT
+const char *rd_kafka_event_name (const rd_kafka_event_t *rkev);
+
+
+/**
+ * @brief Destroy an event.
+ *
+ * @remark Any references to this event, such as extracted messages,
+ *         will not be usable after this call.
+ *
+ * @remark As a convenience it is okay to pass \p rkev as NULL in which case
+ *         no action is performed.
+ */
+RD_EXPORT
+void rd_kafka_event_destroy (rd_kafka_event_t *rkev);
+
+
+/**
+ * @returns the next message from an event.
+ *
+ * Call repeatedly until it returns NULL.
+ *
+ * Event types:
+ *  - RD_KAFKA_EVENT_FETCH  (1 message)
+ *  - RD_KAFKA_EVENT_DR     (>=1 message(s))
+ *
+ * @remark The returned message(s) MUST NOT be
+ *         freed with rd_kafka_message_destroy().
+ */
+RD_EXPORT
+const rd_kafka_message_t *rd_kafka_event_message_next (rd_kafka_event_t *rkev);
+
+
+/**
+ * @brief Extacts \p size message(s) from the event into the
+ *        pre-allocated array \p rkmessages.
+ *
+ * Event types:
+ *  - RD_KAFKA_EVENT_FETCH  (1 message)
+ *  - RD_KAFKA_EVENT_DR     (>=1 message(s))
+ *
+ * @returns the number of messages extracted.
+ */
+RD_EXPORT
+size_t rd_kafka_event_message_array (rd_kafka_event_t *rkev,
+				     const rd_kafka_message_t **rkmessages,
+				     size_t size);
+
+
+/**
+ * @returns the number of remaining messages in the event.
+ *
+ * Event types:
+ *  - RD_KAFKA_EVENT_FETCH  (1 message)
+ *  - RD_KAFKA_EVENT_DR     (>=1 message(s))
+ */
+RD_EXPORT
+size_t rd_kafka_event_message_count (rd_kafka_event_t *rkev);
+
+
+/**
+ * @returns the error code for the event.
+ *
+ * Event types:
+ *  - all
+ */
+RD_EXPORT
+rd_kafka_resp_err_t rd_kafka_event_error (rd_kafka_event_t *rkev);
+
+
+/**
+ * @returns the error string (if any).
+ *          An application should check that rd_kafka_event_error() returns
+ *          non-zero before calling this function.
+ *
+ * Event types:
+ *  - all
+ */
+RD_EXPORT
+const char *rd_kafka_event_error_string (rd_kafka_event_t *rkev);
+
+
+
+/**
+ * @returns the user opaque (if any)
+ *
+ * Event types:
+ *  - RD_KAFKA_OFFSET_COMMIT
+ */
+RD_EXPORT
+void *rd_kafka_event_opaque (rd_kafka_event_t *rkev);
+
+
+/**
+ * @brief Extract log message from the event.
+ *
+ * Event types:
+ *  - RD_KAFKA_EVENT_LOG
+ *
+ * @returns 0 on success or -1 if unsupported event type.
+ */
+RD_EXPORT
+int rd_kafka_event_log (rd_kafka_event_t *rkev,
+			const char **fac, const char **str, int *level);
+
+
+/**
+ * @returns the topic partition list from the event.
+ *
+ * @remark The list MUST NOT be freed with rd_kafka_topic_partition_list_destroy()
+ *
+ * Event types:
+ *  - RD_KAFKA_EVENT_REBALANCE
+ *  - RD_KAFKA_EVENT_OFFSET_COMMIT
+ */
+RD_EXPORT rd_kafka_topic_partition_list_t *
+rd_kafka_event_topic_partition_list (rd_kafka_event_t *rkev);
+
+
+/**
+ * @returns a newly allocated topic_partition container, if applicable for the event type,
+ *          else NULL.
+ *
+ * @remark The returned pointer MUST be freed with rd_kafka_topic_partition_destroy().
+ *
+ * Event types:
+ *   RD_KAFKA_EVENT_ERROR  (for partition level errors)
+ */
+RD_EXPORT rd_kafka_topic_partition_t *
+rd_kafka_event_topic_partition (rd_kafka_event_t *rkev);
+
+
+/**
+ * @brief Poll a queue for an event for max \p timeout_ms.
+ *
+ * @returns an event, or NULL.
+ *
+ * @remark Use rd_kafka_event_destroy() to free the event.
+ */
+RD_EXPORT
+rd_kafka_event_t *rd_kafka_queue_poll (rd_kafka_queue_t *rkqu, int timeout_ms);
+
 
 /**@}*/
 

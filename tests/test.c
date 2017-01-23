@@ -38,7 +38,6 @@
  * is built from within the librdkafka source tree and thus differs. */
 #include "rdkafka.h"
 
-
 int test_level = 2;
 int test_seed = 0;
 
@@ -50,7 +49,6 @@ static int  test_topic_random = 0;
 static int  test_concurrent_max = 20;
 int         test_assert_on_fail = 0;
 double test_timeout_multiplier  = 1.0;
-static char *test_topics_sh = NULL;
 static char *test_sql_cmd = NULL;
 int  test_session_timeout_ms = 6000;
 int          test_broker_version;
@@ -58,6 +56,7 @@ static char *test_broker_version_str = "0.9.0.0";
 int          test_flags = 0;
 int          test_neg_flags = TEST_F_KNOWN_ISSUE;
 static char *test_git_version = "HEAD";
+static char *test_sockem_conf = "";
 
 static int show_summary = 1;
 static int test_summary (int do_lock);
@@ -117,6 +116,20 @@ _TEST_DECL(0035_api_version);
 _TEST_DECL(0036_partial_fetch);
 _TEST_DECL(0037_destroy_hang_local);
 _TEST_DECL(0038_performance);
+_TEST_DECL(0039_event);
+_TEST_DECL(0040_io_event);
+_TEST_DECL(0041_fetch_max_bytes);
+_TEST_DECL(0042_many_topics);
+_TEST_DECL(0043_no_connection);
+_TEST_DECL(0044_partition_cnt);
+_TEST_DECL(0045_subscribe_update);
+_TEST_DECL(0045_subscribe_update_topic_remove);
+_TEST_DECL(0046_rkt_cache);
+_TEST_DECL(0047_partial_buf_tmout);
+_TEST_DECL(0048_partitioner);
+_TEST_DECL(0049_consume_conn_close);
+_TEST_DECL(0050_subscribe_adds);
+_TEST_DECL(0051_assign_adds);
 
 /**
  * Define all tests here
@@ -156,6 +169,22 @@ struct test tests[] = {
 	_TEST(0036_partial_fetch, 0),
 	_TEST(0037_destroy_hang_local, TEST_F_LOCAL),
 	_TEST(0038_performance, 0),
+	_TEST(0039_event, 0),
+	_TEST(0040_io_event, 0, TEST_BRKVER(0,9,0,0)),
+	_TEST(0041_fetch_max_bytes, 0),
+	_TEST(0042_many_topics, 0),
+	_TEST(0043_no_connection, TEST_F_LOCAL),
+	_TEST(0044_partition_cnt, 0),
+	_TEST(0045_subscribe_update, 0),
+	_TEST(0045_subscribe_update_topic_remove, TEST_F_KNOWN_ISSUE),
+	_TEST(0046_rkt_cache, TEST_F_LOCAL),
+	_TEST(0047_partial_buf_tmout, TEST_F_KNOWN_ISSUE),
+	_TEST(0048_partitioner, 0),
+#if WITH_SOCKEM
+        _TEST(0049_consume_conn_close, 0),
+#endif
+        _TEST(0050_subscribe_adds, 0),
+        _TEST(0051_assign_adds, 0),
         { NULL }
 };
 
@@ -164,9 +193,97 @@ RD_TLS struct test *test_curr = &tests[0];
 
 
 
+#if WITH_SOCKEM
+/**
+ * Socket network emulation with sockem
+ */
+ 
+static void test_socket_add (struct test *test, sockem_t *skm) {
+        TEST_LOCK();
+        rd_list_add(&test->sockets, skm);
+        TEST_UNLOCK();
+}
+
+static void test_socket_del (struct test *test, sockem_t *skm, int do_lock) {
+        void *p;
+        if (do_lock)
+                TEST_LOCK();
+        p = rd_list_remove(&test->sockets, skm);
+        assert(p);
+        if (do_lock)
+                TEST_UNLOCK();
+}
+
+void test_socket_close_all (struct test *test, int reinit) {
+        TEST_LOCK();
+        rd_list_destroy(&test->sockets, (void *)sockem_close);
+        if (reinit)
+                rd_list_init(&test->sockets, 16);
+        TEST_UNLOCK();
+}
+
+       
+
+static int test_connect_cb (int s, const struct sockaddr *addr,
+                            int addrlen, const char *id, void *opaque) {
+        struct test *test = opaque;
+        sockem_t *skm;
+        int r;
+
+        TEST_SAY("connect_cb %s\n", id);
+        skm = sockem_connect(s, addr, addrlen, test_sockem_conf, 0, NULL);
+        if (!skm)
+                return errno;
+
+        if (test->connect_cb) {
+                r = test->connect_cb(test, skm, id);
+                if (r)
+                        return r;
+        }
+
+        test_socket_add(test, skm);
+
+        return 0;
+}
+
+static int test_closesocket_cb (int s, void *opaque) {
+        struct test *test = opaque;
+        sockem_t *skm;
+
+        TEST_LOCK();
+        skm = sockem_find(s);
+        if (skm) {
+                sockem_close(skm);
+                test_socket_del(test, skm, 0/*nolock*/);
+        } else {
+#ifdef _MSC_VER
+                closesocket(s);
+#else
+                close(s);
+#endif
+        }
+        TEST_UNLOCK();
+
+        return 0;
+}
+
+
+void test_socket_enable (rd_kafka_conf_t *conf) {
+        rd_kafka_conf_set_connect_cb(conf, test_connect_cb);
+        rd_kafka_conf_set_closesocket_cb(conf, test_closesocket_cb);
+	rd_kafka_conf_set_opaque(conf, test_curr);
+}
+#endif /* WITH_SOCKEM */
+
+
 static void test_error_cb (rd_kafka_t *rk, int err,
 			   const char *reason, void *opaque) {
-	TEST_FAIL("rdkafka error: %s: %s", rd_kafka_err2str(err), reason);
+        if (test_curr->is_fatal_cb && !test_curr->is_fatal_cb(rk, err, reason))
+                TEST_SAY(_C_YEL "rdkafka error (non-fatal): %s: %s\n",
+                         rd_kafka_err2str(err), reason);
+        else
+                TEST_FAIL("rdkafka error: %s: %s",
+                          rd_kafka_err2str(err), reason);
 }
 
 static int test_stats_cb (rd_kafka_t *rk, char *json, size_t json_len,
@@ -208,10 +325,11 @@ static void test_init (void) {
 		test_level = atoi(tmp);
 	if ((tmp = getenv("TEST_MODE")))
 		strncpy(test_mode, tmp, sizeof(test_mode)-1);
+        if ((tmp = getenv("TEST_SOCKEM")))
+                test_sockem_conf = tmp;
 	if ((tmp = getenv("TEST_SEED")))
 		seed = atoi(tmp);
 	else
-
 		seed = test_clock() & 0xffffffff;
 #else
 	{
@@ -306,13 +424,6 @@ static void test_read_conf_file (const char *conf_path,
                         test_concurrent_max = (int)strtod(val, NULL);
                         TEST_UNLOCK();
                         res = RD_KAFKA_CONF_OK;
-		} else if (!strcmp(name, "test.kafka-topics.sh")) {
-			TEST_LOCK();
-			if (test_topics_sh)
-				rd_free(test_topics_sh);
-			test_topics_sh = rd_strdup(val);
-			TEST_UNLOCK();
-			res = RD_KAFKA_CONF_OK;
 		} else if (!strcmp(name, "test.sql.command")) {
 			TEST_LOCK();
 			if (test_sql_cmd)
@@ -390,6 +501,11 @@ void test_conf_init (rd_kafka_conf_t **conf, rd_kafka_topic_conf_t **topic_conf,
 #endif
         }
 
+#if WITH_SOCKEM
+        if (*test_sockem_conf && conf)
+                test_socket_enable(*conf);
+#endif
+
 	if (topic_conf)
 		*topic_conf = rd_kafka_topic_conf_new();
 
@@ -458,6 +574,13 @@ char *test_str_id_generate (char *dest, size_t dest_size) {
 	return dest;
 }
 
+/**
+ * Same as test_str_id_generate but returns a temporary string.
+ */
+const char *test_str_id_generate_tmp (void) {
+	static RD_TLS char ret[64];
+	return test_str_id_generate(ret, sizeof(ret));
+}
 
 /**
  * Format a message token
@@ -476,17 +599,21 @@ void test_msg_fmt (char *dest, size_t dest_size,
  * Parse a message token
  */
 void test_msg_parse0 (const char *func, int line,
-		      uint64_t testid, const void *ptr, size_t size,
+		      uint64_t testid, rd_kafka_message_t *rkmessage,
 		      int32_t exp_partition, int *msgidp) {
 	char buf[128];
 	uint64_t in_testid;
 	int in_part;
 
-	if (!ptr)
-		TEST_FAIL("%s:%i: Message has empty key\n",
-			  func, line);
+	if (!rkmessage->key)
+		TEST_FAIL("%s:%i: Message (%s [%"PRId32"] @ %"PRId64") "
+			  "has empty key\n",
+			  func, line,
+			  rd_kafka_topic_name(rkmessage->rkt),
+			  rkmessage->partition, rkmessage->offset);
 
-	rd_snprintf(buf, sizeof(buf), "%.*s", (int)size, (char *)ptr);
+	rd_snprintf(buf, sizeof(buf), "%.*s", (int)rkmessage->key_len,
+		    (char *)rkmessage->key);
 
 	if (sscanf(buf, "testid=%"SCNu64", partition=%i, msg=%i",
 		   &in_testid, &in_part, msgidp) != 3)
@@ -520,6 +647,9 @@ static int run_test0 (struct run_args *run_args) {
                          stats_file, strerror(errno));
 
 	test_curr = test;
+
+        rd_list_init(&test->sockets, 16);
+
 	TEST_SAY("================= Running test %s =================\n",
 		 test->name);
         if (test->stats_fp)
@@ -550,6 +680,10 @@ static int run_test0 (struct run_args *run_args) {
                          run_args->test->name);
         }
         TEST_UNLOCK();
+
+#if WITH_SOCKEM
+        test_socket_close_all(test, 0);
+#endif
 
         if (test->stats_fp) {
                 long pos = ftell(test->stats_fp);
@@ -648,7 +782,7 @@ static void run_tests (const char *tests_to_run,
 
                 if ((test_flags && (test_flags & test->flags) != test_flags))
                         skip_reason = "filtered due to test flags";
-		if (test_neg_flags & test->flags)
+		if ((test_neg_flags & ~test_flags) & test->flags)
 			skip_reason = "Filtered due to negative test flags";
 		if (test_broker_version &&
 		    (test->minver > test_broker_version ||
@@ -698,7 +832,9 @@ static int test_summary (int do_lock) {
 	int tests_failed_known = 0;
         int tests_passed = 0;
 	FILE *sql_fp = NULL;
+#ifndef _MSC_VER
 	char *tmp;
+#endif
 
         t = time(NULL);
         tm = localtime(&t);
@@ -910,8 +1046,6 @@ static void test_cleanup (void) {
 		test->report_arr = NULL;
 	}
 
-	if (test_topics_sh)
-		rd_free(test_topics_sh);
 	if (test_sql_cmd)
 		rd_free(test_sql_cmd);
 }
@@ -976,6 +1110,8 @@ int main(int argc, char **argv) {
 			       "  TEST_MODE - bare, helgrind, valgrind\n"
 			       "  TEST_SEED - random seed\n"
 			       "  RDKAFKA_TEST_CONF - test config file (test.conf)\n"
+			       "  KAFKA_PATH - Path to kafka source dir\n"
+			       "  ZK_ADDRESS - Zookeeper address\n"
                                "\n",
                                argv[0], argv[i]);
                         exit(1);
@@ -1125,6 +1261,16 @@ rd_kafka_t *test_create_handle (int mode, rd_kafka_conf_t *conf) {
 	rd_kafka_t *rk;
 	char errstr[512];
 
+	if (!conf) {
+		conf = rd_kafka_conf_new();
+#if WITH_SOCKEM
+                if (*test_sockem_conf)
+                        test_socket_enable(conf);
+#endif
+        }
+
+	test_conf_set(conf, "client.id", test_curr->name);
+
 	/* Create kafka instance */
 	rk = rd_kafka_new(mode, conf, errstr, sizeof(errstr));
 	if (!rk)
@@ -1233,6 +1379,7 @@ void test_produce_msgs_nowait (rd_kafka_t *rk, rd_kafka_topic_t *rkt,
 	test_timing_t t_all;
 	char key[128];
 	void *buf;
+	int64_t tot_bytes = 0;
 
 	if (payload)
 		buf = (void *)payload;
@@ -1248,15 +1395,18 @@ void test_produce_msgs_nowait (rd_kafka_t *rk, rd_kafka_topic_t *rkt,
 	TIMING_START(&t_all, "PRODUCE");
 
 	for (msg_id = msg_base ; msg_id < msg_base + cnt ; msg_id++) {
+		size_t len = size;
+
 		if (!payload) {
 			test_msg_fmt(key, sizeof(key), testid, partition,
 				     msg_id);
-			memcpy(buf, key, RD_MIN(size, strlen(key)));
+			len = RD_MIN(size, strlen(key));
+			memcpy(buf, key, len);
 		}
 
 		if (rd_kafka_produce(rkt, partition,
 				     RD_KAFKA_MSG_F_COPY,
-				     buf, size,
+				     buf, len,
 				     !payload ? key : NULL,
 				     !payload ? strlen(key) : 0,
 				     msgcounterp) == -1)
@@ -1266,14 +1416,18 @@ void test_produce_msgs_nowait (rd_kafka_t *rk, rd_kafka_topic_t *rkt,
 				  rd_kafka_err2str(rd_kafka_errno2err(errno)));
 
                 (*msgcounterp)++;
+		tot_bytes += len;
 
 		rd_kafka_poll(rk, 0);
 
-		if (TIMING_EVERY(&t_all, 5*1000000))
-			TEST_SAY("produced %3d%%: %d/%d messages (%d msgs/s)\n",
+		if (TIMING_EVERY(&t_all, 3*1000000))
+			TEST_SAY("produced %3d%%: %d/%d messages "
+				 "(%d msgs/s, %d bytes/s)\n",
 				 ((msg_id - msg_base) * 100) / cnt,
 				 msg_id - msg_base, cnt,
 				 (int)((msg_id - msg_base) /
+				       (TIMING_DURATION(&t_all) / 1000000)),
+				 (int)((tot_bytes) /
 				       (TIMING_DURATION(&t_all) / 1000000)));
         }
 
@@ -1288,12 +1442,22 @@ void test_produce_msgs_nowait (rd_kafka_t *rk, rd_kafka_topic_t *rkt,
  */
 void test_wait_delivery (rd_kafka_t *rk, int *msgcounterp) {
 	test_timing_t t_all;
+        int start_cnt = *msgcounterp;
 
         TIMING_START(&t_all, "PRODUCE.DELIVERY.WAIT");
 
 	/* Wait for messages to be delivered */
-	while (*msgcounterp > 0 && rd_kafka_outq_len(rk) > 0)
+	while (*msgcounterp > 0 && rd_kafka_outq_len(rk) > 0) {
 		rd_kafka_poll(rk, 10);
+                if (TIMING_EVERY(&t_all, 3*1000000)) {
+                        int delivered = start_cnt - *msgcounterp;
+                        TEST_SAY("wait_delivery: "
+                                 "%d/%d messages delivered: %d msgs/s\n",
+                                 delivered, start_cnt,
+                                 (int)(delivered /
+                                       (TIMING_DURATION(&t_all) / 1000000)));
+                }
+        }
 
 	TIMING_STOP(&t_all);
 
@@ -1350,20 +1514,15 @@ rd_kafka_t *test_create_consumer (const char *group_id,
 					  *partitions,
 					  void *opaque),
 				  rd_kafka_conf_t *conf,
-                                  rd_kafka_topic_conf_t *default_topic_conf,
-				  void *opaque) {
+                                  rd_kafka_topic_conf_t *default_topic_conf) {
 	rd_kafka_t *rk;
-	char errstr[512];
 	char tmp[64];
 
 	if (!conf)
 		test_conf_init(&conf, NULL, 0);
 
         if (group_id) {
-                if (rd_kafka_conf_set(conf, "group.id", group_id,
-                                      errstr, sizeof(errstr)) !=
-                    RD_KAFKA_CONF_OK)
-                        TEST_FAIL("Conf failed: %s\n", errstr);
+		test_conf_set(conf, "group.id", group_id);
 
 		rd_snprintf(tmp, sizeof(tmp), "%d", test_session_timeout_ms);
 		test_conf_set(conf, "session.timeout.ms", tmp);
@@ -1374,20 +1533,14 @@ rd_kafka_t *test_create_consumer (const char *group_id,
 		TEST_ASSERT(!rebalance_cb);
 	}
 
-	rd_kafka_conf_set_opaque(conf, opaque);
-
         if (default_topic_conf)
                 rd_kafka_conf_set_default_topic_conf(conf, default_topic_conf);
 
 	/* Create kafka instance */
-	rk = rd_kafka_new(RD_KAFKA_CONSUMER, conf, errstr, sizeof(errstr));
-	if (!rk)
-		TEST_FAIL("Failed to create rdkafka instance: %s\n", errstr);
+	rk = test_create_handle(RD_KAFKA_CONSUMER, conf);
 
 	if (group_id)
 		rd_kafka_poll_set_consumer(rk);
-
-	TEST_SAY("Created kafka instance %s\n", rd_kafka_name(rk));
 
 	return rk;
 }
@@ -1458,6 +1611,7 @@ int64_t test_consume_msgs (const char *what, rd_kafka_topic_t *rkt,
 	int msg_next = exp_msg_base;
 	int fails = 0;
 	int64_t offset_last = -1;
+	int64_t tot_bytes = 0;
 	test_timing_t t_first, t_all;
 
 	TEST_SAY("%s: consume_msgs: %s [%"PRId32"]: expect msg #%d..%d "
@@ -1488,11 +1642,14 @@ int64_t test_consume_msgs (const char *what, rd_kafka_topic_t *rkt,
 
 		rkmessage = rd_kafka_consume(rkt, partition, 5000);
 
-		if (TIMING_EVERY(&t_all, 5*1000000))
+		if (TIMING_EVERY(&t_all, 3*1000000))
 			TEST_SAY("%s: "
-				 "consumed %3d%%: %d/%d messages (%d msgs/s)\n",
+				 "consumed %3d%%: %d/%d messages "
+				 "(%d msgs/s, %d bytes/s)\n",
 				 what, cnt * 100 / exp_cnt, cnt, exp_cnt,
 				 (int)(cnt /
+				       (TIMING_DURATION(&t_all) / 1000000)),
+				 (int)(tot_bytes /
 				       (TIMING_DURATION(&t_all) / 1000000)));
 
 		if (!rkmessage)
@@ -1512,8 +1669,7 @@ int64_t test_consume_msgs (const char *what, rd_kafka_topic_t *rkt,
 			TIMING_STOP(&t_first);
 
 		if (parse_fmt)
-			test_msg_parse(testid, rkmessage->key,
-				       rkmessage->key_len, partition, &msg_id);
+			test_msg_parse(testid, rkmessage, partition, &msg_id);
 		else
 			msg_id = 0;
 
@@ -1535,6 +1691,7 @@ int64_t test_consume_msgs (const char *what, rd_kafka_topic_t *rkt,
 		}
 
 		cnt++;
+		tot_bytes += rkmessage->len;
 		msg_next++;
 		offset_last = rkmessage->offset;
 
@@ -1577,7 +1734,7 @@ test_consume_msgs_easy (const char *group_id, const char *topic,
 		group_id = test_str_id_generate(grpid0, sizeof(grpid0));
 
         test_topic_conf_set(tconf, "auto.offset.reset", "smallest");
-        rk = test_create_consumer(group_id, NULL, NULL, tconf, NULL);
+        rk = test_create_consumer(group_id, NULL, NULL, tconf);
 
         rd_kafka_poll_set_consumer(rk);
 
@@ -1819,8 +1976,9 @@ int test_msgver_add_msg0 (const char *func, int line,
 
 		if (sscanf(buf, "testid=%"SCNu64", partition=%i, msg=%i",
 			   &in_testid, &in_part, &in_msgnum) != 3)
-			TEST_FAIL("%s:%d: Incorrect format: %s",
-				  func, line, buf);
+			TEST_FAIL("%s:%d: Incorrect format at offset %"PRId64
+				  ": %s",
+				  func, line, rkmessage->offset, buf);
 	}
 
 	if (mv->fwd)
@@ -2448,7 +2606,8 @@ int test_consumer_poll (const char *what, rd_kafka_t *rk, uint64_t testid,
                                  rd_kafka_topic_name(rkmessage->rkt),
                                  rkmessage->partition,
                                  rkmessage->offset);
-			test_msgver_add_msg(mv, rkmessage);
+			if (mv)
+				test_msgver_add_msg(mv, rkmessage);
                         eof_cnt++;
 
                 } else if (rkmessage->err) {
@@ -2462,7 +2621,7 @@ int test_consumer_poll (const char *what, rd_kafka_t *rk, uint64_t testid,
                                  rd_kafka_message_errstr(rkmessage));
 
                 } else {
-			if (test_msgver_add_msg(mv, rkmessage))
+			if (!mv || test_msgver_add_msg(mv, rkmessage))
 				cnt++;
                 }
 
@@ -2488,6 +2647,22 @@ void test_consumer_close (rd_kafka_t *rk) {
         if (err)
                 TEST_FAIL("Failed to close consumer: %s\n",
                           rd_kafka_err2str(err));
+}
+
+
+void test_flush (rd_kafka_t *rk, int timeout_ms) {
+	test_timing_t timing;
+	rd_kafka_resp_err_t err;
+
+	TEST_SAY("%s: Flushing %d messages\n",
+		 rd_kafka_name(rk), rd_kafka_outq_len(rk));
+	TIMING_START(&timing, "FLUSH");
+	err = rd_kafka_flush(rk, timeout_ms);
+	TIMING_STOP(&timing);
+	if (err)
+		TEST_FAIL("Failed to flush(%s, %d): %s\n",
+			  rd_kafka_name(rk), timeout_ms,
+			  rd_kafka_err2str(err));
 }
 
 
@@ -2533,37 +2708,38 @@ void test_print_partition_list (const rd_kafka_topic_partition_list_t
         }
 }
 
-
 /**
- * @brief Create topic using kafka-topics.sh --create
+ * @brief Execute kafka-topics.sh from the Kafka distribution.
  */
-void test_create_topic (const char *topicname, int partition_cnt,
-			int replication_factor) {
+void test_kafka_topics (const char *fmt, ...) {
 #ifdef _MSC_VER
 	TEST_FAIL("%s not supported on Windows, yet", __FUNCTION__);
 #else
-	char cmd[1024];
+	char cmd[512];
 	int r;
-	test_timing_t t_run;
+	va_list ap;
+	test_timing_t t_cmd;
+	const char *kpath, *zk;
 
-	TEST_LOCK();
-	if (!test_topics_sh) {
-		TEST_UNLOCK();
-		TEST_FAIL("\"test.kafka-topics.sh\" not configured, should be "
-			  "\"..path/to/kafka-topics-sh "
-			  "--zookeeper someAddress\"");
-	}
+	kpath = getenv("KAFKA_PATH");
+	zk = getenv("ZK_ADDRESS");
 
-	rd_snprintf(cmd, sizeof(cmd), "%s --create --topic \"%s\" "
-		    "--replication-factor %d --partitions %d",
-		    test_topics_sh, topicname,
-		    replication_factor, partition_cnt);
-	TEST_UNLOCK();
+	if (!kpath || !*kpath || !zk || !*zk)
+		TEST_FAIL("%s: KAFKA_PATH and ZK_ADDRESS must be set",
+			  __FUNCTION__);
+
+	r = rd_snprintf(cmd, sizeof(cmd),
+			"%s/bin/kafka-topics.sh --zookeeper %s ", kpath, zk);
+	TEST_ASSERT(r < (int)sizeof(cmd));
+
+	va_start(ap, fmt);
+	rd_vsnprintf(cmd+r, sizeof(cmd)-r, fmt, ap);
+	va_end(ap);
 
 	TEST_SAY("Executing: %s\n", cmd);
-	TIMING_START(&t_run, "exec.create.topic");
+	TIMING_START(&t_cmd, "exec");
 	r = system(cmd);
-	TIMING_STOP(&t_run);
+	TIMING_STOP(&t_cmd);
 
 	if (r == -1)
 		TEST_FAIL("system(\"%s\") failed: %s", cmd, strerror(errno));
@@ -2575,6 +2751,35 @@ void test_create_topic (const char *topicname, int partition_cnt,
 			  cmd, WEXITSTATUS(r));
 #endif
 }
+
+
+/**
+ * @brief Create topic using kafka-topics.sh --create
+ */
+void test_create_topic (const char *topicname, int partition_cnt,
+			int replication_factor) {
+	test_kafka_topics("--create --topic \"%s\" "
+			  "--replication-factor %d --partitions %d",
+			  topicname, replication_factor, partition_cnt);
+}
+
+
+/**
+ * @brief Let the broker auto-create the topic for us.
+ */
+void test_auto_create_topic_rkt (rd_kafka_t *rk, rd_kafka_topic_t *rkt) {
+	const struct rd_kafka_metadata *metadata;
+	rd_kafka_resp_err_t err;
+	test_timing_t t;
+
+	TIMING_START(&t, "auto_create_topic");
+	err = rd_kafka_metadata(rk, 0, rkt, &metadata, tmout_multip(15000));
+	TIMING_STOP(&t);
+	TEST_ASSERT(!err, "metadata() failed: %s", rd_kafka_err2str(err));
+
+	rd_kafka_metadata_destroy(metadata);
+}
+
 
 /**
  * @brief Check if \p feature is builtin to librdkafka.
@@ -2643,4 +2848,72 @@ void test_report_add (struct test *test, const char *fmt, ...) {
 	test->report_arr[test->report_cnt++] = rd_strdup(buf);
 
 	TEST_SAYL(1, "Report #%d: %s\n", test->report_cnt-1, buf);
+}
+
+/**
+ * Returns 1 if KAFKA_PATH and ZK_ADDRESS is set to se we can use the
+ * kafka-topics.sh script to manually create topics.
+ *
+ * If \p skip is set TEST_SKIP() will be called with a helpful message.
+ */
+int test_can_create_topics (int skip) {
+#ifdef _MSC_VER
+	if (skip)
+		TEST_SKIP("Cannot create topics on Win32");
+	return 0;
+#else
+	const char *s;
+
+	if (!(s = getenv("KAFKA_PATH")) || !*s ||
+	    !(s = getenv("ZK_ADDRESS")) || !*s) {
+		if (skip)
+			TEST_SKIP("Cannot create topics "
+				  "(set KAFKA_PATH and ZK_ADDRESS)\n");
+		return 0;
+	}
+
+
+	return 1;
+#endif
+}
+
+
+/**
+ * Wait for \p event_type, discarding all other events prior to it.
+ */
+rd_kafka_event_t *test_wait_event (rd_kafka_queue_t *eventq,
+				   rd_kafka_event_type_t event_type,
+				   int timeout_ms) {
+	test_timing_t t_w;
+	int64_t abs_timeout = test_clock() + (timeout_ms * 1000);
+
+	TIMING_START(&t_w, "wait_event");
+	while (test_clock() < abs_timeout) {
+		rd_kafka_event_t *rkev;
+
+		rkev = rd_kafka_queue_poll(eventq,
+					   (int)(abs_timeout - test_clock())/
+					   1000);
+
+		if (rd_kafka_event_type(rkev) == event_type) {
+			TIMING_STOP(&t_w);
+			return rkev;
+		}
+
+		if (!rkev)
+			continue;
+
+		if (rd_kafka_event_error(rkev))
+			TEST_SAY("discarding ignored event %s: %s\n",
+				 rd_kafka_event_name(rkev),
+				 rd_kafka_event_error_string(rkev));
+		else
+			TEST_SAY("discarding ignored event %s\n",
+				 rd_kafka_event_name(rkev));
+		rd_kafka_event_destroy(rkev);
+
+	}
+	TIMING_STOP(&t_w);
+
+	return NULL;
 }

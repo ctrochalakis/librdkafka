@@ -34,20 +34,20 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
     <ConfigurationType>DynamicLibrary</ConfigurationType>
     <UseDebugLibraries>true</UseDebugLibraries>
-    <PlatformToolset>v140</PlatformToolset>
+    <PlatformToolset>v120</PlatformToolset>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="Configuration">
     <ConfigurationType>DynamicLibrary</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
-    <PlatformToolset>v140</PlatformToolset>
+    <PlatformToolset>v120</PlatformToolset>
     <WholeProgramOptimization>true</WholeProgramOptimization>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
     <ConfigurationType>DynamicLibrary</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
-    <PlatformToolset>v140</PlatformToolset>
+    <PlatformToolset>v120</PlatformToolset>
     <WholeProgramOptimization>true</WholeProgramOptimization>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
@@ -168,6 +168,7 @@
     <ClInclude Include="..\src\rdkafka_buf.h" />
     <ClInclude Include="..\src\rdkafka_cgrp.h" />
     <ClInclude Include="..\src\rdkafka_conf.h" />
+    <ClInclude Include="..\src\rdkafka_event.h" />
     <ClInclude Include="..\src\rdkafka_feature.h" />
     <ClInclude Include="..\src\rdkafka_op.h" />
     <ClInclude Include="..\src\rdkafka_partition.h" />
@@ -189,16 +190,20 @@
     <ClInclude Include="..\src\rdkafka_timer.h" />
     <ClInclude Include="..\src\rdkafka_topic.h" />
     <ClInclude Include="..\src\rdkafka_transport.h" />
+    <ClInclude Include="..\src\rdkafka_metadata.h" />
     <ClInclude Include="..\src\rdlog.h" />
     <ClInclude Include="..\src\rdrand.h" />
     <ClInclude Include="..\src\rdsysqueue.h" />
     <ClInclude Include="..\src\rdtime.h" />
     <ClInclude Include="..\src\rdtypes.h" />
+    <ClInclude Include="..\src\rdregex.h" />
     <ClInclude Include="..\src\snappy.h" />
     <ClInclude Include="..\src\snappy_compat.h" />
     <ClInclude Include="..\src\tinycthread.h" />
     <ClInclude Include="..\src\rdwin32.h" />
     <ClInclude Include="..\src\win32_config.h" />
+    <ClInclude Include="..\src\xxhash.h" />
+    <ClInclude Include="..\src\regexp.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\src\rdaddr.c" />
@@ -209,6 +214,7 @@
     <ClCompile Include="..\src\rdkafka_broker.c" />
     <ClCompile Include="..\src\rdkafka_cgrp.c" />
     <ClCompile Include="..\src\rdkafka_conf.c" />
+    <ClCompile Include="..\src\rdkafka_event.c" />
     <ClCompile Include="..\src\rdkafka_msg.c" />
     <ClCompile Include="..\src\rdkafka_offset.c" />
     <ClCompile Include="..\src\rdkafka_op.c" />
@@ -224,12 +230,16 @@
     <ClCompile Include="..\src\rdkafka_transport.c" />
     <ClCompile Include="..\src\rdkafka_buf.c" />
     <ClCompile Include="..\src\rdkafka_feature.c" />
+    <ClCompile Include="..\src\rdkafka_metadata.c" />
     <ClCompile Include="..\src\rdlist.c" />
     <ClCompile Include="..\src\rdlog.c" />
     <ClCompile Include="..\src\rdstring.c" />
     <ClCompile Include="..\src\rdrand.c" />
+    <ClCompile Include="..\src\rdregex.c" />
     <ClCompile Include="..\src\snappy.c" />
     <ClCompile Include="..\src\tinycthread.c" />
+    <ClCompile Include="..\src\xxhash.c" />
+    <ClCompile Include="..\src\regexp.c" />
   </ItemGroup>
   <ItemGroup>
     <Text Include="..\LICENSE..txt" />

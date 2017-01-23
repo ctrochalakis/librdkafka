@@ -1,14 +1,14 @@
 librdkafka - Apache Kafka C/C++ client library
 ==============================================
 
-Copyright (c) 2012-2015, [Magnus Edenhill](http://www.edenhill.se/).
+Copyright (c) 2012-2016, [Magnus Edenhill](http://www.edenhill.se/).
 
 [https://github.com/edenhill/librdkafka](https://github.com/edenhill/librdkafka)
 
 **librdkafka** is a C library implementation of the
 [Apache Kafka](http://kafka.apache.org/) protocol, containing both
 Producer and Consumer support. It was designed with message delivery reliability
-and high performance in mind, current figures exceed 800000 msgs/second for
+and high performance in mind, current figures exceed 1 million msgs/second for
 the producer and 3 million msgs/second for the consumer.
 
 **librdkafka** is licensed under the 2-clause BSD license.
@@ -22,17 +22,17 @@ See the [wiki](https://github.com/edenhill/librdkafka/wiki) for a FAQ.
 
 [![Gitter chat](https://badges.gitter.im/edenhill/librdkafka.png)](https://gitter.im/edenhill/librdkafka)
 
-**Apache Kafka 0.8 & 0.9 support:**
+**Apache Kafka 0.8 & 0.9 & 0.10 support:**
 
   * Branch: master
   * Producer: supported
   * High-level balanced KafkaConsumer: supported (requires broker >= 0.9)
   * Simple Consumer: supported
-  * Compression: snappy and gzip
+  * Compression: snappy, gzip, lz4
   * Broker version support: >=0.8
   * Debian package: librdkafka1 and librdkafka-dev in Debian and Ubuntu
   * ZooKeeper: not supported
-  * C API: Stable, ABI safe, backwards compatible with 0.8
+  * C API: Stable, ABI safe
   * C++ API: Stable
   * Tests: Regression tests in `tests/` directory.
   * Statistics: JSON formatted, see `rd_kafka_conf_set_stats_cb` in `rdkafka.h`.
@@ -63,10 +63,13 @@ See the [wiki](https://github.com/edenhill/librdkafka/wiki) for a FAQ.
   * OCaml: [ocaml-kafka](https://github.com/didier-wenzek/ocaml-kafka)
   * PHP: [phpkafka](https://github.com/EVODelavega/phpkafka)
   * PHP: [php-rdkafka](https://github.com/arnaud-lb/php-rdkafka)
-  * Python: [python-librdkafka](https://bitbucket.org/yungchin/python-librdkafka)
+  * Python: [confluent-kafka-python](https://github.com/confluentinc/confluent-kafka-python)
   * Python: [PyKafka](https://github.com/Parsely/pykafka)
   * Ruby: [Hermann](https://github.com/stancampbell3/Hermann)
   * Tcl: [KafkaTcl](https://github.com/flightaware/kafkatcl)
+  * C#/.NET: [rdkafka-dotnet](https://github.com/ah-/rdkafka-dotnet)
+  * D (C-like): [librdkafka](https://github.com/DlangApache/librdkafka/)
+  * D (C++-like): [librdkafkad](https://github.com/tamediadigital/librdkafka-d)
 
 #Users of librdkafka#
 
@@ -99,6 +102,7 @@ See the [wiki](https://github.com/edenhill/librdkafka/wiki) for a FAQ.
 	zlib (optional, for gzip compression support)
 	libssl-dev (optional, for SSL support)
 	libsasl2-dev (optional, for SASL support)
+	liblz4-dev (optional, for LZ4 compression support)
 
 ## Instructions
 

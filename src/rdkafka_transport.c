@@ -65,12 +65,25 @@
 #if WITH_SSL
 static mtx_t *rd_kafka_ssl_locks;
 static int    rd_kafka_ssl_locks_cnt;
-
-static once_flag rd_kafka_ssl_init_once = ONCE_FLAG_INIT;
 #endif
 
 
 
+/**
+ * Low-level socket close
+ */
+static void rd_kafka_transport_close0 (rd_kafka_t *rk, int s) {
+        if (rk->rk_conf.closesocket_cb)
+                rk->rk_conf.closesocket_cb(s, rk->rk_conf.opaque);
+        else {
+#ifndef _MSC_VER
+		close(s);
+#else
+		closesocket(s);
+#endif
+        }
+
+}
 
 /**
  * Close and destroy a transport handle
@@ -91,13 +104,9 @@ void rd_kafka_transport_close (rd_kafka_transport_t *rktrans) {
 	if (rktrans->rktrans_recv_buf)
 		rd_kafka_buf_destroy(rktrans->rktrans_recv_buf);
 
-	if (rktrans->rktrans_s != -1) {
-#ifndef _MSC_VER
-		close(rktrans->rktrans_s);
-#else
-		closesocket(rktrans->rktrans_s);
-#endif
-	}
+	if (rktrans->rktrans_s != -1)
+                rd_kafka_transport_close0(rktrans->rktrans_rkb->rkb_rk,
+                                          rktrans->rktrans_s);
 
 	rd_free(rktrans);
 }
@@ -284,31 +293,31 @@ static void rd_kafka_transport_ssl_lock_cb (int mode, int i,
 }
 
 static unsigned long rd_kafka_transport_ssl_threadid_cb (void) {
-	return (unsigned long)thrd_current();
+	return (unsigned long)(intptr_t)thrd_current();
 }
 
 
 /**
  * Global OpenSSL cleanup.
- *
- * NOTE: This function is never called, see rd_kafka_transport_term()
  */
-static RD_UNUSED void rd_kafka_transport_ssl_term (void) {
+void rd_kafka_transport_ssl_term (void) {
 	int i;
 
-	ERR_free_strings();
+	CRYPTO_set_id_callback(NULL);
+	CRYPTO_set_locking_callback(NULL);
 
 	for (i = 0 ; i < rd_kafka_ssl_locks_cnt ; i++)
 		mtx_destroy(&rd_kafka_ssl_locks[i]);
 
 	rd_free(rd_kafka_ssl_locks);
+
 }
 
 
 /**
  * Global OpenSSL init.
  */
-static void rd_kafka_transport_ssl_init (void) {
+void rd_kafka_transport_ssl_init (void) {
 	int i;
 	
 	rd_kafka_ssl_locks_cnt = CRYPTO_num_locks();
@@ -582,7 +591,7 @@ static int rd_kafka_transport_ssl_handhsake (rd_kafka_transport_t *rktrans) {
 	} else if (rd_kafka_transport_ssl_io_update(rktrans, r,
 						    errstr,
 						    sizeof(errstr)) == -1) {
-		rd_kafka_broker_fail(rkb, RD_KAFKA_RESP_ERR__SSL, LOG_ERR,
+		rd_kafka_broker_fail(rkb, LOG_ERR, RD_KAFKA_RESP_ERR__SSL,
 				     "SSL handshake failed: %s%s", errstr,
 				     strstr(errstr, "unexpected message") ?
 				     ": client authentication might be "
@@ -618,13 +627,14 @@ int rd_kafka_transport_ssl_ctx_init (rd_kafka_t *rk,
 	int r;
 	SSL_CTX *ctx;
 
-	call_once(&rd_kafka_ssl_init_once, rd_kafka_transport_ssl_init);
-
-	
 	ctx = SSL_CTX_new(SSLv23_client_method());
 	if (!ctx)
 		goto fail;
 
+#ifdef SSL_OP_NO_SSLv3
+	/* Disable SSLv3 (unsafe) */
+	SSL_CTX_set_options(ctx, SSL_OP_NO_SSLv3);
+#endif
 
 	/* Key file password callback */
 	SSL_CTX_set_default_passwd_cb(ctx, rd_kafka_transport_ssl_passwd_cb);
@@ -787,6 +797,7 @@ int rd_kafka_transport_framed_recvmsg (rd_kafka_transport_t *rktrans,
 		/* Point read buffer to main buffer. */
 		rkbuf->rkbuf_rbuf = rkbuf->rkbuf_buf;
 		rd_kafka_buf_push(rkbuf, rkbuf->rkbuf_buf, 4);
+		rkbuf->rkbuf_len = 0; /* read bytes is zero */
 
 		rktrans->rktrans_recv_buf = rkbuf;
 	}
@@ -896,6 +907,17 @@ static void rd_kafka_transport_connected (rd_kafka_transport_t *rktrans) {
 				   socket_strerror(socket_errno));
 	}
 
+#ifdef TCP_NODELAY
+	if (rkb->rkb_rk->rk_conf.socket_nagle_disable) {
+		int one = 1;
+		if (setsockopt(rktrans->rktrans_s, IPPROTO_TCP, TCP_NODELAY,
+			       (void *)&one, sizeof(one)) == SOCKET_ERROR)
+			rd_rkb_log(rkb, LOG_WARNING, "NAGLE",
+				   "Failed to disable Nagle (TCP_NODELAY) "
+				   "on socket %d: %s",
+				   socket_strerror(socket_errno));
+	}
+#endif
 
 
 #if WITH_SSL
@@ -1084,7 +1106,7 @@ rd_kafka_transport_t *rd_kafka_transport_connect (rd_kafka_broker_t *rkb,
 	rd_kafka_transport_t *rktrans;
 	int s = -1;
 	int on = 1;
-
+        int r;
 
         rkb->rkb_addr_last = sinx;
 
@@ -1151,23 +1173,34 @@ rd_kafka_transport_t *rd_kafka_transport_connect (rd_kafka_broker_t *rkb,
 		   rd_kafka_secproto_names[rkb->rkb_proto], s);
 
 	/* Connect to broker */
-	if (connect(s, (struct sockaddr *)sinx,
-		    RD_SOCKADDR_INX_LEN(sinx)) == SOCKET_ERROR &&
-	    (socket_errno != EINPROGRESS
+        if (rkb->rkb_rk->rk_conf.connect_cb) {
+                r = rkb->rkb_rk->rk_conf.connect_cb(
+                        s, (struct sockaddr *)sinx, RD_SOCKADDR_INX_LEN(sinx),
+                        rkb->rkb_name, rkb->rkb_rk->rk_conf.opaque);
+        } else {
+                if (connect(s, (struct sockaddr *)sinx,
+                            RD_SOCKADDR_INX_LEN(sinx)) == SOCKET_ERROR &&
+                    (socket_errno != EINPROGRESS
 #ifdef _MSC_VER
-		&& socket_errno != WSAEWOULDBLOCK
+                     && socket_errno != WSAEWOULDBLOCK
 #endif
-		)) {
+                            ))
+                        r = socket_errno;
+                else
+                        r = 0;
+        }
+
+        if (r != 0) {
 		rd_rkb_dbg(rkb, BROKER, "CONNECT",
 			   "couldn't connect to %s: %s (%i)",
 			   rd_sockaddr2str(sinx,
 					   RD_SOCKADDR2STR_F_PORT |
 					   RD_SOCKADDR2STR_F_FAMILY),
-			   socket_strerror(socket_errno), socket_errno);
+			   socket_strerror(r), r);
 		rd_snprintf(errstr, errstr_size,
 			    "Failed to connect to broker at %s: %s",
 			    rd_sockaddr2str(sinx, RD_SOCKADDR2STR_F_NICE),
-			    socket_strerror(socket_errno));
+			    socket_strerror(r));
 		goto err;
 	}
 
@@ -1183,13 +1216,9 @@ rd_kafka_transport_t *rd_kafka_transport_connect (rd_kafka_broker_t *rkb,
 	return rktrans;
 
  err:
-	if (s != -1) {
-#ifndef _MSC_VER
-		close(s);
-#else
-		closesocket(s);
-#endif
-	}
+	if (s != -1)
+                rd_kafka_transport_close0(rkb->rkb_rk, s);
+
 	return NULL;
 }
 
@@ -1255,18 +1284,12 @@ int rd_kafka_transport_poll(rd_kafka_transport_t *rktrans, int tmout) {
  * Global cleanup.
  * This is dangerous and SHOULD NOT be called since it will rip
  * the rug from under the application if it uses any of this functionality
- * in its own code. This means we will leak some memory (in the OpenSSL case)
- * on exit.
+ * in its own code. This means we might leak some memory on exit.
  */
 void rd_kafka_transport_term (void) {
 #ifdef _MSC_VER
 	(void)WSACleanup(); /* FIXME: dangerous */
 #endif
-
-#if WITH_SSL
-	rd_kafka_transport_ssl_term();
-#endif
-
 }
 #endif
  

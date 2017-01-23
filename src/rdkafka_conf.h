@@ -9,6 +9,7 @@ typedef enum {
 	RD_KAFKA_COMPRESSION_NONE,
 	RD_KAFKA_COMPRESSION_GZIP = RD_KAFKA_MSG_ATTR_GZIP,
 	RD_KAFKA_COMPRESSION_SNAPPY = RD_KAFKA_MSG_ATTR_SNAPPY,
+        RD_KAFKA_COMPRESSION_LZ4 = RD_KAFKA_MSG_ATTR_LZ4,
 	RD_KAFKA_COMPRESSION_INHERIT /* Inherit setting from global conf */
 } rd_kafka_compression_t;
 
@@ -56,7 +57,9 @@ struct rd_kafka_conf_s {
 	/*
 	 * Generic configuration
 	 */
+	int     enabled_events;
 	int     max_msg_size;
+	int     msg_copy_max_size;
         int     recv_max_msg_size;
 	int     max_inflight;
 	int     metadata_request_timeout_ms;
@@ -72,6 +75,7 @@ struct rd_kafka_conf_s {
 	int     socket_sndbuf_size;
 	int     socket_rcvbuf_size;
         int     socket_keepalive;
+	int     socket_nagle_disable;
         int     socket_max_fails;
 	char   *client_id_str;
         rd_kafkap_str_t *client_id;
@@ -127,7 +131,7 @@ struct rd_kafka_conf_s {
         char  *group_id_str;
         rd_kafkap_str_t   *group_id;    /* Consumer group id */
 
-        rd_kafka_pattern_list_t topic_blacklist;
+        rd_kafka_pattern_list_t *topic_blacklist;
         struct rd_kafka_topic_conf_s *topic_conf; /* Default topic config
                                                    * for automatically
                                                    * subscribed topics. */
@@ -153,11 +157,13 @@ struct rd_kafka_conf_s {
                                   void *opaque);
 
         rd_kafka_offset_method_t offset_store_method;
+	int enable_partition_eof;
 
 	/*
 	 * Producer configuration
 	 */
 	int    queue_buffering_max_msgs;
+	int    queue_buffering_max_kbytes;
 	int    buffering_max_ms;
 	int    max_retries;
 	int    retry_backoff_ms;
@@ -217,6 +223,16 @@ struct rd_kafka_conf_s {
 
         /* Socket creation callback */
         int (*socket_cb) (int domain, int type, int protocol, void *opaque);
+
+        /* Connect callback */
+        int (*connect_cb) (int sockfd,
+                           const struct sockaddr *addr,
+                           int addrlen,
+                           const char *id,
+                           void *opaque);
+
+        /* Close socket callback */
+        int (*closesocket_cb) (int sockfd, void *opaque);
 
 		/* File open callback */
         int (*open_cb) (const char *pathname, int flags, mode_t mode,
