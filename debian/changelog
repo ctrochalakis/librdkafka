@@ -1,7 +1,7 @@
 librdkafka (0.9.3-1) unstable; urgency=medium
 
   * New upstream release.
-  * Enable LZ4 compression.
+  * Add Build-Depends to liblz4-dev to enable LZ4 compression.
   * Add copyright for xxhash.[hc] and regexp.[hc].
   * Update librdkafka1.symbols for 0.9.2 and 0.9.3.
   * Use hardening build flags.
