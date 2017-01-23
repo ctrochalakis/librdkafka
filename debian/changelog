@@ -1,8 +1,13 @@
-librdkafka (0.9.3-1) UNRELEASED; urgency=medium
+librdkafka (0.9.3-1) unstable; urgency=medium
 
   * New upstream release.
+  * Enable LZ4 compression.
+  * Add copyright for xxhash.[hc] and regexp.[hc].
+  * Update librdkafka1.symbols for 0.9.2 and 0.9.3.
+  * Use hardening build flags.
+  * Add myself to Uploaders.
 
- -- Christos Trochalakis <ctrochalakis@debian.org>  Mon, 23 Jan 2017 16:19:22 +0200
+ -- Christos Trochalakis <ctrochalakis@debian.org>  Mon, 23 Jan 2017 16:50:05 +0200
 
 librdkafka (0.9.1-1) unstable; urgency=medium
 
